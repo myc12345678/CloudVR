@@ -26,16 +26,17 @@ python3 scripts/gen_config.py        # 重新生成 Gstreamer/config.h 和 html/
 `signalling-server/certs/` 中只提交公开证书 `dev-cert.pem`。所有私钥
 （`*.key`、`*.pfx`、`*.new`、`backup/`、`dev-key.pem`）均被 gitignore，**绝不可进入仓库历史**。
 
-## WebRTC 预编译库（不入库，需恢复）
+## WebRTC 预编译库（Git LFS 管理）
 
 `Godot/test/addons/webrtc/lib/` 是第三方 Godot WebRTC native GDExtension
-的各平台预编译二进制（约 98MB，非本仓库源码），**已被 gitignore**。
+的各平台预编译二进制（约 98MB，非本仓库源码），改由 **Git LFS** 存储，仓库内只保留 LFS 指针。
 
-全新 clone 后，Godot 端要能运行需把该插件重新装回原目录。恢复方式（二选一）：
-
-- 从你当初获取该 addon 的同一来源重命名/拷贝 `libwebrtc_native.*` 到
-  `Godot/test/addons/webrtc/lib/`；
-- 或按该 GDExtension 的源码上重新构建对应平台产物。
+首次在仓库内使用需安装 LFS 过滤器：
+```bash
+git lfs install
+```
+克隆时文件会由 LFS 自动拉取（需机器上已安装 git-lfs）。若某台机器没有 git-lfs，
+clone 后只会得到指针而不是真实二进制。
 
 ## 构建（GStreamer 端）
 

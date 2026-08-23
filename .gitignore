@@ -23,8 +23,8 @@ Gstreamer/compile_commands.json
 
 # ---- Godot ----
 Godot/test/.godot/
-# 第三方 webrtc_native GDExtension 预编译库（约 98MB），见 README 恢复方式
-Godot/test/addons/webrtc/lib/
+# 第三方 webrtc_native GDExtension 预编译库（约 98MB）改由 Git LFS 管理，
+# 见 .gitattributes 与 README，不再在此忽略。
 
 # ---- 运行日志 ----
 html/logs/
