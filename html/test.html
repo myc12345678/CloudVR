@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Godot WebRTC Stream Viewer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <div class="page">
+    <section class="hero">
+      <div>
+        <div class="badge">Godot → GStreamer → WebRTC → Browser</div>
+        <h1>实时串流预览面板</h1>
+        <p>
+          这个页面用于接收来自 GStreamer 的 WebRTC 视频流，展示 Godot 摄像机画面。
+          我保留了原有的信令与调试能力，同时把播放器、状态和日志整合成了更适合演示的界面。
+        </p>
+      </div>
+      <div class="badge" id="heroStatus">准备连接信令服务</div>
+    </section>
+
+    <section class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>远端视频</h2>
+          <div class="pill" id="streamBadge">等待视频轨…</div>
+        </div>
+        <div class="panel-body">
+          <div class="video-shell">
+            <video id="remoteVideo" autoplay playsinline muted></video>
+            <div class="video-overlay">
+              <div class="video-meta">
+                <div class="pill">Peer: <strong id="peerLabel">cpp_sender</strong></div>
+                <div class="pill">Viewer: <strong id="selfLabel">browser</strong></div>
+              </div>
+              <div class="pill" id="resolutionBadge">分辨率: --</div>
+            </div>
+          </div>
+
+          <div class="controls">
+            <button class="primary" id="playButton">开始播放</button>
+            <button class="secondary" id="clearLogButton">清空日志</button>
+          </div>
+
+          <div class="hint">
+            如果浏览器因为自动播放策略未立即播放，可以点击“开始播放”。
+            页面右侧会同步显示 WebSocket、ICE、PeerConnection 和视频状态，方便你现场排查。
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>连接状态</h3>
+          <div class="pill" id="overallBadge">初始化中</div>
+        </div>
+        <div class="panel-body">
+          <div class="status-grid">
+            <div class="status-card">
+              <div class="status-label">WebSocket</div>
+              <div class="status-value"><span class="dot" id="wsDot"></span><span id="wsStatus">connecting</span></div>
+            </div>
+            <div class="status-card">
+              <div class="status-label">PeerConnection</div>
+              <div class="status-value"><span class="dot" id="pcDot"></span><span id="pcStatus">new</span></div>
+            </div>
+            <div class="status-card">
+              <div class="status-label">ICE</div>
+              <div class="status-value"><span class="dot" id="iceDot"></span><span id="iceStatus">new</span></div>
+            </div>
+            <div class="status-card">
+              <div class="status-label">Video</div>
+              <div class="status-value"><span class="dot" id="videoDot"></span><span id="videoStatus">idle</span></div>
+            </div>
+            <div class="status-card latency-card">
+              <div class="status-label">延迟</div>
+              <div class="status-value latency-value" id="latencyValue">-- ms</div>
+              <div class="latency-detail" id="latencyDetail"></div>
+            </div>
+          </div>
+
+          <div class="facts">
+            <div class="fact"><span>信令地址</span><strong id="wsUrlText"></strong></div>
+            <div class="fact"><span>本地 ID</span><strong id="selfIdText"></strong></div>
+            <div class="fact"><span>目标 Peer</span><strong id="peerIdText"></strong></div>
+          </div>
+
+          <div class="panel-head" style="padding: 18px 0 0; border-bottom: 0; background: transparent;">
+            <h3>运行日志</h3>
+          </div>
+          <div class="log-box" id="logBox"></div>
+
+          <div class="footer-note">
+            日志会同时输出到浏览器控制台和页面内面板，便于演示与调试。
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="script.js"></script>
+</body>
+
+</html>
