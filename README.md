@@ -40,6 +40,11 @@ git lfs install
 # 3) 构建 GStreamer 发送端
 cd Gstreamer && make                        # 产物为 webrtc_sender（已 gitignore）
 cd ..
+
+# 4) 首次导入 Godot 项目（生成 .godot 导入缓存 / UID 映射）。
+#    若缺失，直接运行会报 “Main scene's path could not be resolved from UID”。
+cd Godot/test && godot --headless --import --path "$PWD"
+cd ../..
 ```
 
 ## 启动流程（完整）
