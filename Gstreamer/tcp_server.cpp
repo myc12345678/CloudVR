@@ -138,6 +138,10 @@ static void tcp_server_loop() {
                sizeof(keepintvl));
     setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
+    // 禁用 Nagle：输入指令是小包低延迟场景，攒批会引入几十毫秒抖动
+    int nodelay = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
     {
       std::lock_guard<std::mutex> lock(tcp_client_mutex);
       tcp_client_fd = client_fd;

@@ -39,9 +39,9 @@ func _ready() -> void:
 
 # 从项目根目录的 config.json 加载所有运行参数
 func _load_config() -> void:
-	var config_path := "res://../config.json" # Godot res:// 映射到项目目录
+	var config_path := "res://../../config.json" # config.json 在仓库根目录；res:// = <repo>/Godot/test
 	if not FileAccess.file_exists(config_path):
-		# 回退：尝试从绝对路径加载（编辑器运行场景时 res://../ 可能不可用）
+		# 回退：尝试从机器相关绝对路径加载（编辑器/不同启动方式下 res:// 可能不同）
 		config_path = "user://../../config.json"
 		if not FileAccess.file_exists(config_path):
 			push_warning("未找到 config.json，使用内置默认值")
