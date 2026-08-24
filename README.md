@@ -122,7 +122,41 @@ cd Gstreamer && ./webrtc_sender
 | 8443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 |
 | 9002 | webrtc_sender (TCP) | 接收 Godot 控制输入通道 |
 
-共享内存：`/dev/shm/godot_webrtc_frame`（零拷贝帧传输，1920×1080 RGBA8 = 8,294,416 字节）。
+共享内存：`/dev/shm/godot_webrtc_frame`（零拷贝帧传输，1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。
+
+## 关闭流程
+
+按启动的逆序关闭所有常驻进程，并清理共享内存：
+
+```bash
+# 1) 关闭 nginx（优雅停止 master + worker）
+nginx -s stop -c "$(pwd)/html/nginx.conf"
+
+# 2) 结束 Godot（run_godot.sh 前台运行时按 Ctrl+C 即可；否则按 PID 结束）
+pkill -f 'godot --path' 2>/dev/null || true
+
+# 3) 结束 GStreamer 发送端
+pkill -f webrtc_sender 2>/dev/null || true
+
+# 4) 结束信令服务器
+pkill -f 'node server.js' 2>/dev/null || true
+
+# 5) 删除共享内存帧文件（下次启动会重新创建）
+rm -f /dev/shm/godot_webrtc_frame
+```
+
+### 确认已关闭
+
+```bash
+# 应无任何项目进程
+ps -eo pid,cmd | grep -E '[g]odot --path|[w]ebrtc_sender|[n]ode server\.js|[n]ginx:' | grep -v grep
+# 应无项目端口被占用
+ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
+```
+
+> 说明：`node server.js` / `webrtc_sender` / `godot` 若在前台终端运行，直接 `Ctrl+C`
+> 即可退出；上表用 `pkill` 是为了脚本化关闭。`/dev/shm` 里的是共享内存帧文件，
+> 退出后残留不影响下次启动（Godot 启动时会重新创建）。
 
 ## 配置（机器相关，不入库）
 
