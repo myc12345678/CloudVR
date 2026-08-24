@@ -15,6 +15,10 @@ var SHM_PATH := "/dev/shm/godot_webrtc_frame"
 var SHM_HEADER_SIZE := 16
 var SHM_FRAME_MAX_SIZE := 1920 * 1080 * 3 # RGB8, 启动时由 config.json 重新计算
 
+# 用 SubViewport 独立渲染并取帧：与主窗口解耦，窗口最小化/失焦时仍持续渲染
+# （也避开 get_image() 真实帧 get_data() 慢的问题）
+var _sub_viewport: SubViewport
+
 var tcp := StreamPeerTCP.new()
 var frame_interval := 1.0 / TARGET_FPS
 var frame_accumulator := 0.0
@@ -39,8 +43,25 @@ func _ready() -> void:
 	OS.low_processor_usage_mode = false
 	# 关闭 vsync，避免主循环被显示器刷新率限制，方便跑满目标帧率
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	# 用 SubViewport 独立渲染世界：与主窗口解耦，窗口最小化/失焦时仍持续渲染，
+	# 且读取其纹理可避开主视口 get_image() 真实帧 get_data() 慢的问题。
+	_setup_sub_viewport()
 	_attempt_connect()
 	_open_shm()
+
+
+func _setup_sub_viewport() -> void:
+	_sub_viewport = SubViewport.new()
+	_sub_viewport.size = Vector2i(TARGET_WIDTH, TARGET_HEIGHT)
+	_sub_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	add_child(_sub_viewport)
+	# 把场景世界（Player、相机、网格、环境等）从主视口移入 SubViewport，
+	# 使 Camera3D 渲染到该离屏 render target。
+	for child in get_children():
+		if child == _sub_viewport:
+			continue
+		child.reparent(_sub_viewport)
+
 
 # 从项目根目录的 config.json 加载所有运行参数
 func _load_config() -> void:
@@ -225,8 +246,8 @@ func _update_connection_state() -> void:
 #   5. ready = 1
 
 func send_frame() -> void:
-	# 捕获视口纹理（窗口已设为 TARGET_WIDTH×TARGET_HEIGHT）
-	var tex := get_viewport().get_texture()
+	# 捕获 SubViewport 的纹理（离屏 render target，与主窗口解耦）
+	var tex := _sub_viewport.get_texture()
 	if tex == null:
 		return
 
@@ -249,8 +270,6 @@ func send_frame() -> void:
 	# 通过共享内存发送原始 RGB 帧（零拷贝，零编解码）
 	if shm_file:
 		_send_frame_via_shm(data)
-
-	# 不再通过 TCP 发送视频帧（TCP 仅用于控制指令）
 
 
 func _send_frame_via_shm(rgba_data: PackedByteArray) -> void:
