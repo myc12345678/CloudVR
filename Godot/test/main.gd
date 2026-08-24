@@ -13,7 +13,7 @@ var TARGET_HEIGHT := 1080
 var TARGET_FPS := 30.0
 var SHM_PATH := "/dev/shm/godot_webrtc_frame"
 var SHM_HEADER_SIZE := 16
-var SHM_FRAME_MAX_SIZE := 1920 * 1080 * 4 # RGBA8, 启动时由 config.json 重新计算
+var SHM_FRAME_MAX_SIZE := 1920 * 1080 * 3 # RGB8, 启动时由 config.json 重新计算
 
 var tcp := StreamPeerTCP.new()
 var frame_interval := 1.0 / TARGET_FPS
@@ -34,6 +34,11 @@ func _ready() -> void:
 	_load_config()
 	# 将窗口渲染分辨率设为目标大小，省去 send_frame 中的 CPU resize()
 	get_window().set_size(Vector2i(TARGET_WIDTH, TARGET_HEIGHT))
+	# 关键：窗口最小化/失焦时也要持续渲染帧，否则共享内存帧会被冻结、
+	# 导致浏览器端视频不再更新。关闭低处理器模式，让主循环不在失焦时休眠。
+	OS.low_processor_usage_mode = false
+	# 关闭 vsync，避免主循环被显示器刷新率限制，方便跑满目标帧率
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	_attempt_connect()
 	_open_shm()
 
@@ -83,8 +88,8 @@ func _load_config() -> void:
 		var s = cfg["shm"]
 		if s.has("path"): SHM_PATH = str(s["path"])
 
-	# 重新计算帧缓冲区大小
-	SHM_FRAME_MAX_SIZE = TARGET_WIDTH * TARGET_HEIGHT * 4
+	# 重新计算帧缓冲区大小（RGB8 = 每像素 3 字节）
+	SHM_FRAME_MAX_SIZE = TARGET_WIDTH * TARGET_HEIGHT * 3
 	frame_interval = 1.0 / TARGET_FPS
 
 	print("配置已从 config.json 加载: %dx%d@%dfps, SHM=%s" %
@@ -235,15 +240,13 @@ func send_frame() -> void:
 	if img_w != TARGET_WIDTH or img_h != TARGET_HEIGHT:
 		img.resize(TARGET_WIDTH, TARGET_HEIGHT)
 
-	# 大部分 GPU 后端 get_image() 返回 RGBA8，convlert 仅在非 RGBA 时执行
-	if img.get_format() != Image.FORMAT_RGBA8:
-		img.convert(Image.FORMAT_RGBA8)
-
+	# 直接发送原始 RGB8 数据（get_image() 返回 FORMAT_RGB8），
+	# 避免每帧 RGB8→RGBA8 的昂贵 CPU 转换（之前是 ~24ms 瓶颈）
 	var data := img.get_data()
 	if data.is_empty():
 		return
 
-	# 通过共享内存发送原始 RGBA 帧（零拷贝，零编解码）
+	# 通过共享内存发送原始 RGB 帧（零拷贝，零编解码）
 	if shm_file:
 		_send_frame_via_shm(data)
 

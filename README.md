@@ -73,10 +73,11 @@ nginx -c "$(pwd)/html/nginx.conf"
 ### 第 3 步：Godot 客户端（创建共享内存帧）
 
 ```bash
-cd Godot/test && godot --path "$PWD"
+./scripts/run_godot.sh            # 强制用 NVIDIA 独显启动（见下方说明）
 ```
-- 打开渲染窗口（`1920×1080@30fps`），创建并写入 `/dev/shm/godot_webrtc_frame`
+- 打开渲染窗口（分辨率/帧率取自 `config.json` 的 `video`，当前 1920×1080@60fps），创建并写入 `/dev/shm/godot_webrtc_frame`
 - 以 TCP 客户端方式连接发送端的 `9002`（未连上时会每 2 秒重试）
+- **为什么用脚本**：笔记本混合显卡（PRIME/Optimus）下，Godot 窗口失焦/最小化时系统会切到核显（iGPU）渲染，导致帧率骤降。`scripts/run_godot.sh` 通过 `__NV_PRIME_RENDER_OFFLOAD=1` 等环境变量强制使用 NVIDIA 独显，保证任何焦点状态下都用 4060。
 
 ### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC）
 

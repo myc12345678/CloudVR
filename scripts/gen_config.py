@@ -74,7 +74,7 @@ constexpr const char *ENC_RTP_CAPS       = {enc_is_hw}
 
 // Shared memory
 constexpr const char *SHM_PATH        = "{shm['path']}";
-constexpr size_t      SHM_FRAME_MAX_SIZE  = {v['width']} * {v['height']} * 4;
+constexpr size_t      SHM_FRAME_MAX_SIZE  = {v['width']} * {v['height']} * 3; // RGB8
 constexpr size_t      SHM_FRAME_HEADER_SIZE = 16;
 constexpr size_t      SHM_TOTAL_SIZE       = SHM_FRAME_HEADER_SIZE + SHM_FRAME_MAX_SIZE;
 

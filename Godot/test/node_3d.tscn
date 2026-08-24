@@ -26,8 +26,8 @@ sky_material = SubResource("PhysicalSkyMaterial_4xowi")
 [sub_resource type="Environment" id="Environment_noarx"]
 background_mode = 2
 sky = SubResource("Sky_a202f")
-ssao_enabled = true
-sdfgi_enabled = true
+ssao_enabled = false
+sdfgi_enabled = false
 
 [sub_resource type="CameraAttributesPhysical" id="CameraAttributesPhysical_a202f"]
 

@@ -77,7 +77,7 @@ static std::string build_pipeline_desc() {
   desc << "webrtcbin name=webrtc bundle-policy=max-bundle "
        << "stun-server=stun://stun.l.google.com:19302 "
        << "appsrc name=godotsrc is-live=true format=time do-timestamp=true "
-       << "caps=video/x-raw,format=RGBA,"
+       << "caps=video/x-raw,format=RGB,"
        << "width=" << FRAME_WIDTH << ","
        << "height=" << FRAME_HEIGHT << ","
        << "framerate=" << FRAME_FPS << "/1 ! "
