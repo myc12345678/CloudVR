@@ -1,7 +1,5 @@
 extends Node
 
-@onready var player: CharacterBody3D = $Player
-
 # ======================== 从 config.json 读取配置 ========================
 # 所有可配置参数集中在项目根目录 config.json，修改后无需改代码。
 # 如需在运行时重新加载，调用 _load_config() 即可。
@@ -358,25 +356,6 @@ func _handle_input_command(json_str: String) -> void:
 	if data == null or not data is Dictionary:
 		return
 
-	var input_type: String = data.get("type", "")
-	var key_name: String = data.get("key", "")
-	match input_type:
-		"keydown":
-			if key_name in player.Network_Input:
-				player.Network_Input[key_name] = true
-		"keyup":
-			if key_name in player.Network_Input:
-				player.Network_Input[key_name] = false
-		"mousemove":
-			# 浏览器端鼠标移动，当前 Player 不需要（WASD 键盘控制）
-			# 数据格式: {"type":"mousemove","x":0.741,"y":-0.5359}
-			# 如需鼠标瞄准/视角旋转，在此处处理归一化坐标 (x,y)
-			pass
-		"mousedown", "mouseup":
-			# 鼠标按键事件，当前未使用
-			pass
-		"wheel":
-			# 鼠标滚轮事件，当前未使用
-			pass
-		_:
-			push_warning("未知输入类型: %s 完整数据: %s" % [input_type, json_str])
+	# 交给网络输入路由器翻译成逻辑动作并注入 Input 单例
+	NetworkInputRouter.handle_remote_input(
+		str(data.get("type", "")), data)

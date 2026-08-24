@@ -6,7 +6,7 @@
 
 | 路径 | 内容 |
 |------|------|
-| `Godot/test/` | Godot 游戏引擎（GDScript + 场景），渲染/捕获帧、接收反向输入 |
+| `Godot/test/` | Godot 游戏引擎（GDScript + 场景），渲染/捕获帧、接收反向输入（经 `NetworkInputRouter` / `VirtualMouse` 封装进标准 Godot 输入体系） |
 | `Gstreamer/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送 |
 | `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 |
 | `html/` | 浏览器前端（WebRTC 接收端）+ nginx 配置 |
@@ -123,6 +123,46 @@ cd Gstreamer && ./webrtc_sender
 | 9002 | webrtc_sender (TCP) | 接收 Godot 控制输入通道 |
 
 共享内存：`/dev/shm/godot_webrtc_frame`（零拷贝帧传输，1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。
+
+## 输入系统与后续开发注意
+
+Godot 端已把"网络输入"封装进标准的 Godot 输入体系，**游戏逻辑可照 Godot 官方文档开发**。
+数据流：`浏览器 → 信令服务器 → webrtc_sender → TCP 9002 → main.gd → NetworkInputRouter → Input 单例 → Player`。
+
+### 两端分层
+
+- **游戏逻辑（照 Godot 文档）**：`Player.gd` 用 `Input.get_axis()` / `Input.get_vector()` 读取动作；
+  动作定义在 `project.godot` 的 `[input]`（四个动作 `move_forward` / `move_back` / `turn_left` / `turn_right`）。
+- **自定义输入桥（需自己维护）**：
+  - `NetworkInputRouter`（autoload）把浏览器按键翻译成逻辑动作，再 `Input.action_press()` 注入；
+  - `VirtualMouse`（autoload）把 `mousemove` 的归一化坐标转成增量（delta）。
+  这两个 autoload 均已在 `project.godot` 的 `[autoload]` 注册。
+
+### 关键差异：输入是"远程"的
+
+`[input]` 里四个动作的 `events` **均为空**，没有绑定本地物理键——真正触发靠
+`NetworkInputRouter` 调用 `Input.action_press()`，而不是本地键盘事件。因此：
+
+- 在编辑器里给 `InputMap` 添加物理键**不会**生效（浏览器不经过本地事件）；
+- 新增输入必须**同时**改三处：
+  1. `NetworkInputRouter.gd` 的 `ACTION_MAP` 加一行映射（如 `"KeySpace": &"jump"`）；
+  2. `project.godot` 的 `[input]` 加"空事件"动作（如 `jump={ "deadzone": 0.5, "events": [] }`）；
+  3. 消费脚本（如 `Player.gd`）用标准 `Input` API 读取。
+
+> 浏览器端 `html/script.js` 已**无差别转发所有 `keydown`**（带 `key` / `code`），新增键盘键**无需**改浏览器；
+> 若新增加鼠标/滚轮等事件，则需在 `script.js` 的 `sendInput` 处补发。
+
+### 两个容易踩的坑
+
+- **键盘自动重复**：按住键浏览器会连续触发 `keydown`。`Input.is_action_just_pressed` 只在
+  "未按→按下"过渡帧为真，一般够用；但"跳跃"这类一次性动作若出现重复触发，需自行去重。
+- **鼠标坐标是归一化的（0~1）**：`mousemove` 给的是相对 `video` 元素的归一化坐标，不是位移增量。
+  所以鼠标视角**不能**按 `InputEventMouseMotion` 那套写，要用 `VirtualMouse` 取增量再驱动相机。
+
+### 视频流（非 Godot 文档范围）
+
+`SubViewport` 渲染 → 共享内存零拷贝 → GStreamer NVENC → WebRTC 这段与本系统耦合，
+与 Godot 官方文档无关；改动请参考 `Gstreamer/`、`shared_frame.h`。
 
 ## 关闭流程
 

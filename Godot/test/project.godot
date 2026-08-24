@@ -15,6 +15,30 @@ run/main_scene="uid://cfrhyxgrw488v"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
 
+[autoload]
+
+VirtualMouse="*res://VirtualMouse.gd"
+NetworkInputRouter="*res://NetworkInputRouter.gd"
+
+[input]
+
+move_forward={
+"deadzone": 0.5,
+"events": []
+}
+move_back={
+"deadzone": 0.5,
+"events": []
+}
+turn_left={
+"deadzone": 0.5,
+"events": []
+}
+turn_right={
+"deadzone": 0.5,
+"events": []
+}
+
 [physics]
 
 3d/physics_engine="Jolt Physics"
