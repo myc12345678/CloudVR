@@ -1,4 +1,4 @@
-# Godot → WebRTC 古镇ar导览系统 — 技术文档
+# Godot → WebRTC 低延迟流式传输系统 — 技术文档
 
 ## 1. 项目概述
 
@@ -9,7 +9,7 @@
 | 组件 | 语言 | 角色 |
 |------|------|------|
 | **Godot 游戏引擎** | GDScript | 渲染 3D 场景，捕获帧数据，接收输入指令 |
-| **GStreamer 发送端** | C++17 | 从共享内存读取 RGBA 帧，硬件/软件编码后通过 WebRTC 发送 |
+| **GStreamer 发送端** | C++17 | 从共享内存读取 RGB 帧，硬件/软件编码后通过 WebRTC 发送 |
 | **Signalling Server** | Node.js (零依赖) | WebSocket 信令中继 + 输入消息转发 |
 | **Browser 前端** | HTML/JS | WebRTC 接收端，解码播放视频并回传用户输入 |
 | **Nginx** | 配置 | 反向代理，提供 HTTPS/WSS 前端服务 |
@@ -17,7 +17,7 @@
 ### 1.2 关键性能指标
 
 - 分辨率：1920×1080（可配置）
-- 帧率：30 FPS（可配置）
+- 帧率：60 FPS（可配置）
 - 编码：NVENC 硬件 H.264 或软件 VP8
 - 视频传输延迟：共享内存零拷贝（μs 级），WebRTC e2e 延迟实时监控
 - 输入延迟：绕过 JSON 解析的快速通道转发
@@ -46,7 +46,7 @@
 │  ┌──────────────┐   ┌──────────────────────────────────────────┐    │
 │  │ tcp_server   │   │  shm_reader_loop()                        │    │
 │  │ 接收控制指令   │   │  mmap → SharedFrameLayout → appsrc       │    │
-│  │ →send_to_godot│  │  零拷贝 RGBA 帧推入 GStreamer pipeline    │    │
+│  │ →send_to_godot│  │  零拷贝 RGB8 帧推入 GStreamer pipeline    │    │
 │  └──────┬───────┘   └──────────────┬───────────────────────────┘    │
 │         │                          │                                 │
 │         │   ┌──────────────────────▼──────────────────────────┐     │
@@ -83,8 +83,8 @@
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │                     Nginx (反向代理)                                  │
-│  HTTP :8080  → 静态文件服务 (html/)                                  │
-│  HTTPS :8444 → SSL 终端 + proxy_pass http://127.0.0.1:8080          │
+│  HTTP :8080  → 301 重定向到 HTTPS :8444                              │
+│  HTTPS :8444 → SSL 终端 + 静态文件服务 (html/, index test.html)       │
 │  /ws 路径    → proxy_pass https://127.0.0.1:8443 (signalling)       │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
@@ -112,9 +112,9 @@
 
 ```
 【视频管线】
-  Godot GPU 渲染
-    → get_viewport().get_texture().get_image()
-    → RGBA8 PackedByteArray
+  Godot GPU 渲染 (SubViewport 离屏)
+    → _sub_viewport.get_texture().get_image()
+    → RGB8 PackedByteArray
     → 写入 /dev/shm/godot_webrtc_frame (共享内存，零拷贝)
     → GStreamer shm_reader_loop() mmap 读取
     → appsrc 推入 GStreamer Pipeline
@@ -133,8 +133,8 @@
     → GStreamer on_ws_message() → handle_input_message()
     → TCP send_to_godot() (4字节大端长度头 + JSON payload)
     → Godot read_input_commands()
-    → player.Network_Input["w"] = true
-    → Player._physics_process() 角色移动
+    → NetworkInputRouter.handle_remote_input() → Input.action_press()
+    → 消费脚本 (Player.gd) 用标准 `Input` API 读取并驱动移动
 ```
 
 ---
@@ -159,7 +159,7 @@ config.json
 
 | 配置路径 | 说明 | 示例值 |
 |---------|------|--------|
-| `video.width` / `height` / `fps` | 视频分辨率和帧率 | 1920 / 1080 / 30 |
+| `video.width` / `height` / `fps` | 视频分辨率和帧率 | 1920 / 1080 / 60 |
 | `godot.tcp_port` | Godot ↔ GStreamer TCP 控制端口 | 9002 |
 | `gstreamer.self_id` / `peer_id` | WebRTC 会话 ID | cpp_sender / browser |
 | `gstreamer.signalling_url` | 信令服务器 WSS 地址 | wss://127.0.0.1:8443 |
@@ -167,7 +167,7 @@ config.json
 | `encoding.encoder` | GStreamer 编码器元素名 | nvautogpuh264enc |
 | `encoding.bitrate_kbps` | 编码码率 (kbps) | 15000 |
 | `encoding.preset` | 编码预设 | low-latency |
-| `encoding.rc_mode` | 码率控制模式 | cbr |
+| `encoding.rate_control` | 码率控制模式 | cbr |
 | `shm.path` | 共享内存文件路径 | /dev/shm/godot_webrtc_frame |
 
 ### 3.2 GStreamer 发送端 (C++)
@@ -193,12 +193,12 @@ Pipeline 通过 `gst_parse_launch()` 从字符串描述构建，支持两种编�
 **NVENC 硬件编码路径**：
 ```
 appsrc name=godotsrc is-live=true format=time do-timestamp=true
-  caps=video/x-raw,format=RGBA,width=1920,height=1080,framerate=30/1
+  caps=video/x-raw,format=RGB,width=1920,height=1080,framerate=60/1
   ! queue max-size-bytes=0 max-size-buffers=1 max-size-time=0 leaky=downstream
   ! videoconvert
   ! queue max-size-bytes=0 max-size-buffers=1 max-size-time=0 leaky=downstream
   ! cudaupload                    ← 零拷贝上传 CPU 帧到 GPU 显存
-  ! cudaconvert                   ← GPU 端格式转换 (RGBA→NV12)
+  ! cudaconvert                   ← GPU 端格式转换 (RGB→NV12)
   ! nvautogpuh264enc preset=low-latency bitrate=15000 gop-size=15 bframes=0 rc-mode=cbr
   ! h264parse
   ! rtph264pay pt=96 config-interval=-1
@@ -238,7 +238,7 @@ Offset  Size  Field          说明
 0x008   4     frame_size      当前帧数据字节数 (uint32)
 0x00C   1     ready           写入完成标志 (0/1)
 0x00D   3     padding         对齐填充
-0x010   N     data[]          RGBA8 原始像素数据
+0x010   N     data[]          RGB8 原始像素数据
 ```
 
 **写入协议 (Godot → GStreamer)**：
@@ -246,14 +246,14 @@ Offset  Size  Field          说明
 ```
 Godot 写入流程 (main.gd _send_frame_via_shm):
   1. ready = 0                    ← 标记"写入中"，读者等待
-  2. seek(16) + store_buffer()    ← 写入 RGBA 像素数据
+  2. seek(16) + store_buffer()    ← 写入 RGB 像素数据
   3. write_counter++              ← 自增帧计数
   4. frame_size = size            ← 写入帧大小
   5. ready = 1                    ← 一次性写入头部 16 字节 + flush()
 
 GStreamer 读取流程 (tcp_server.cpp shm_reader_loop):
   1. wc = write_counter (acquire) ← 原子读取
-  2. if wc == last → sleep 3ms   ← 无新帧则休眠 (30fps 下 33ms 间隔足够)
+  2. if wc == last → sleep 3ms   ← 无新帧则休眠 (60fps 下 16.6ms 间隔足够)
   3. while (!ready) spin+yield   ← 自旋等待写入完成
   4. push_raw_frame_to_appsrc()   ← 零拷贝推入 GStreamer pipeline
   5. last = wc                    ← 自动跳过中间未读帧 (帧丢弃)
@@ -264,7 +264,7 @@ GStreamer 读取流程 (tcp_server.cpp shm_reader_loop):
 - Godot 使用 `FileAccess` 读写 `/dev/shm` 中的**普通文件**（非 POSIX `shm_open`），GStreamer 使用 `open() + mmap()` 映射同一文件
 - 文件大小匹配校验：两进程启动时都检查文件大小是否与当前分辨率匹配，不匹配则拒绝连接或重建文件
 - 写入顺序通过原子变量 `ready` 的 acquire/release 语义保证
-- 轮询间隔 3ms：在 30fps (33ms/帧) 下足够响应，CPU 占用极低
+- 轮询间隔 3ms：在 60fps (16.6ms/帧) 下足够响应，CPU 占用极低
 
 #### 3.2.4 WebRTC 信令 (`signalling.cpp`)
 
@@ -384,7 +384,7 @@ connectWebSocket()
 |--------|---------|------|
 | `jitterBufferTarget = 0` | `setRemoteDescription` 后 + `ontrack` | 消除 jitter buffer 累积延迟 |
 | `playoutDelayHint = {min:0, max:0.05}` | 同上 | 限制解码缓冲不超过 50ms |
-| frame decryption 优化 | `pc.getReceivers()` 遍历 | 对每个 receiver 设置，不依赖 track kind |
+| 统一应用于所有 receiver | `pc.getReceivers()` 遍历 | 不依赖 track kind，统一设置低延迟缓冲 |
 
 #### 3.4.3 延迟统计面板
 
@@ -405,7 +405,7 @@ connectWebSocket()
 | 事件 | 节流 | 数据格式 |
 |------|------|---------|
 | `keydown` / `keyup` | 无节流 | `{"type":"keydown","key":"w","code":"KeyW"}` |
-| `mousemove` | 16ms (~60fps) | `{"type":"mousemove","x":0.741,"y":-0.5359}` |
+| `mousemove` | 16ms (~60fps) | `{"type":"mousemove","x":0.741,"y":0.4235}` |
 | `mousedown` / `mouseup` | 无节流 | `{"type":"mousedown","button":0,"x":...,"y":...}` |
 | `wheel` | 无节流 | `{"type":"wheel","deltaX":...,"deltaY":...,"deltaZ":...}` |
 
@@ -420,43 +420,49 @@ connectWebSocket()
 
 ```
 _ready():
-  ├── _load_config()            ← 从 config.json 读取参数
-  ├── get_window().set_size()   ← 窗口设为目标渲染分辨率 (避免 CPU resize)
-  ├── _attempt_connect()        ← 连接 GStreamer TCP 控制通道
-  └── _open_shm()               ← 打开 /dev/shm 共享内存文件
+  ├── _load_config()              ← 从 config.json 读取参数
+  ├── get_window().set_size()     ← 窗口设为目标渲染分辨率 (避免 CPU resize)
+  ├── OS.low_processor_usage_mode = false  ← 失焦/最小化时仍持续渲染
+  ├── DisplayServer.VSYNC_DISABLED         ← 关闭垂直同步以跑满目标帧率
+  ├── _setup_sub_viewport()       ← 建立离屏 SubViewport 渲染世界
+  ├── _attempt_connect()          ← 连接 GStreamer TCP 控制通道
+  └── _open_shm()                 ← 打开 /dev/shm 共享内存文件
 
 _process(delta):
   ├── _update_connection_state()  ← 驱动非阻塞 TCP 连接
+  ├── 若未连接 → 每 2 秒重试 _attempt_connect()
   ├── read_input_commands()       ← 读取 TCP 控制指令 (状态机解析)
   ├── frame_accumulator += delta
   └── if accumulator >= frame_interval → send_frame()
 
 send_frame():
-  ├── get_viewport().get_texture()
-  ├── 获取图像数据 (RGBA8, 无需转换时零开销)
+  ├── _sub_viewport.get_texture().get_image()   ← 离屏纹理回读 (RGB8)
+  ├── 必要时 resize 到目标分辨率
   ├── _send_frame_via_shm(data)
   │   ├── ready = 0
-  │   ├── seek(16) store_buffer(rgba_data)   ← 写入像素数据
+  │   ├── seek(16) store_buffer(data)   ← 写入 RGB8 像素数据
   │   ├── 构建 16 字节头: counter + size + ready=1
   │   └── seek(0) store_buffer(header) flush()  ← 原子写入头 + 提交
 ```
 
-**帧率控制**：通过 `frame_accumulator` 累积 delta 时间，达到 `1.0 / TARGET_FPS` 阈值时才发送一帧 (30fps = 33.3ms)。
+**帧率控制**：通过 `frame_accumulator` 累积 delta 时间，达到 `1.0 / TARGET_FPS` 阈值时才发送一帧 (60fps = 16.7ms)。渲染在离屏 `SubViewport` 中进行，与主窗口解耦，因此窗口失焦/最小化时仍持续出帧。
 
 #### 3.5.2 `Player.gd` — 角色控制器
 
 ```
 _physics_process(delta):
-  ├── if Network_Input["a"] → rotate_y(+Rotate_Speed * delta)  ← 左转
-  ├── if Network_Input["d"] → rotate_y(-Rotate_Speed * delta)  ← 右转
-  ├── if not is_on_floor()  → velocity += gravity
-  ├── if Network_Input["w"] → 向前移动
-  ├── if Network_Input["s"] → 向后移动
-  ├── else → velocity = 0
+  ├── turn = Input.get_axis("turn_right", "turn_left")
+  ├── rotate_y(turn * Rotate_Speed * delta)     ← a 左转 / d 右转
+  ├── if not is_on_floor() → velocity += gravity
+  ├── move = Input.get_axis("move_back", "move_forward")
+  ├── velocity.x = forward_dir.x * move * Speed  ← w 前进 / s 后退
+  ├── velocity.z = forward_dir.z * move * Speed
   └── move_and_slide()
 ```
 
-**控制流**：`Network_Input` 字典由 `main.gd` 的 `_handle_input_command()` 根据 TCP 接收到的 JSON 指令实时更新。
+**控制流**：`main.gd` 把 TCP 收到的输入指令交给 `NetworkInputRouter.handle_remote_input()`，由其用
+`Input.action_press()/action_release()` 注入标准 `Input` 单例；`Player.gd` 直接用 `Input.get_axis()` 等标准 API
+读取动作，完全不感知网络来源（键盘输入已被封装进 Godot 的输入体系）。
 
 ---
 
@@ -481,6 +487,11 @@ make                                # 编译 webrtc_sender
 
 ### 4.3 启动顺序
 
+> **顺序关键**：`webrtc_sender` 的 `start_shm_frame_reader()` 只在**启动时**打开一次
+> `/dev/shm/godot_webrtc_frame`。因此必须**先启动 Godot**（其 `_ready()` 会创建该共享内存文件），
+> **再启动 GStreamer 发送端**；否则 sender 会报
+> `open(...) failed ... falling back to TCP (start Godot first)` 并读不到帧。
+
 ```bash
 # 1. 启动 Signalling Server
 node signalling-server/server.js &
@@ -488,15 +499,16 @@ node signalling-server/server.js &
 # 2. (可选) 启动 Nginx
 #    nginx -c html/nginx.conf
 
-# 3. 启动 GStreamer 发送端
+# 3. 启动 Godot 游戏项目（先于 GStreamer，创建共享内存帧）
+#    在 Godot 编辑器中打开 Godot/test/project.godot 并运行
+#    或命令行（推荐用脚本强制 NVIDIA 独显）：./scripts/run_godot.sh
+
+# 4. 启动 GStreamer 发送端（此时 shm 文件已存在，才会真正读帧）
 cd Gstreamer && ./webrtc_sender &
 
-# 4. 启动 Godot 游戏项目
-#    在 Godot 编辑器中打开 Godot/test/project.godot 并运行
-
 # 5. 浏览器访问
-#    http://localhost:8080/test.html
-#    或 https://localhost:8444/test.html (通过 Nginx)
+#    http://127.0.0.1:8080/  (301 重定向到 HTTPS)
+#    或 https://127.0.0.1:8444/ (通过 Nginx，推荐)
 ```
 
 ### 4.4 配置调整
@@ -527,7 +539,7 @@ cd Gstreamer && make
 
 ### 5.3 为什么使用 NVENC 硬件编码？
 
-- **零拷贝 GPU 路径**：`cudaupload` 直接将 CPU 内存中的 RGBA 帧上传到 GPU 显存，无需额外拷贝
+- **零拷贝 GPU 路径**：`cudaupload` 直接将 CPU 内存中的 RGB 帧上传到 GPU 显存，无需额外拷贝
 - **超低编码延迟**：NVENC 的 `low-latency` preset + `bframes=0` 消除帧重排序延迟
 - **高码率支持**：15000 kbps CBR 保证 1080p 画面质量
 
@@ -569,7 +581,9 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 └── Godot/
     └── test/
         ├── project.godot                # Godot 项目文件
-        ├── main.gd                      # 帧捕获 + 配置加载
+        ├── main.gd                      # 帧捕获 + 配置加载 + 输入指令入口
+        ├── NetworkInputRouter.gd        # 网络输入路由器（autoload）
+        ├── VirtualMouse.gd              # 虚拟鼠标（autoload）
         ├── Player.gd                    # 角色控制器
         ├── node_3d.tscn                 # 主场景
         └── addons/webrtc/               # WebRTC GDExtension
@@ -584,9 +598,9 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 ```
 E2E Latency = T_capture + T_shm + T_encode + T_network + T_jitter + T_decode
 
-T_capture  ≈ 0.1ms   (get_image() GPU→CPU 回读)
+T_capture  ≈ 0.1ms   (SubViewport get_image() GPU→CPU 回读)
 T_shm      ≈ 0.01ms  (mmap 零拷贝, 原子变量轮询)
-T_encode   ≈ 2-5ms   (NVENC 硬件 H.264, 1080p@30fps)
+T_encode   ≈ 2-5ms   (NVENC 硬件 H.264, 1080p@60fps)
 T_network  ≈ RTT/2   (局域网 < 1ms, 互联网 10-50ms)
 T_jitter   ≈ 0-5ms   (jitterBufferTarget=0 时趋于 0)
 T_decode   ≈ 1-3ms   (浏览器硬件 H.264 解码)
@@ -602,7 +616,7 @@ Total      ≈ 4-14ms  (局域网) / 15-60ms (互联网)
 
 ### 8.1 零拷贝共享内存帧传输
 
-Godot（写入端）将 RGBA8 像素数据写入 `/dev/shm` 文件，GStreamer（读取端）通过 `mmap` 零拷贝映射同一文件。延迟从 TCP 的毫秒级降至微秒级。
+Godot（写入端）将 RGB8 像素数据写入 `/dev/shm` 文件，GStreamer（读取端）通过 `mmap` 零拷贝映射同一文件。延迟从 TCP 的毫秒级降至微秒级。
 
 **数据结构（两端一致）：**
 
@@ -613,7 +627,7 @@ struct SharedFrameLayout {
   std::atomic<uint32_t> frame_size;      // offset 8: 帧数据字节数
   std::atomic<uint8_t>  ready;           // offset 12: 写入完成标志
   uint8_t               padding[3];       // offset 13: 对齐到 16 字节
-  uint8_t               data[SHM_FRAME_MAX_SIZE]; // offset 16: RGBA8 像素
+  uint8_t               data[SHM_FRAME_MAX_SIZE]; // offset 16: RGB8 像素
 };
 ```
 
@@ -624,7 +638,7 @@ struct SharedFrameLayout {
 shm_file.seek(12)
 shm_file.store_8(0)                    # ready = 0 (写入中)
 shm_file.seek(16)
-shm_file.store_buffer(rgba_data)       # 写入像素数据
+shm_file.store_buffer(frame_data)       # 写入 RGB8 像素数据
 
 # 单次 seek + store_buffer 原子写入头信息
 var header := PackedByteArray()
@@ -705,7 +719,7 @@ setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 **Node.js 端（原样转发，不走 `JSON.parse` + `JSON.stringify`）：**
 
 ```javascript
-// signalling-server/server.js — handleTextMessage()
+// signalling-server/server.js — handleTextFromClient()
 if (msg.startsWith('{"input":')) {
     sendTextFrame(peerState, msg);   // 原样转发，零解析开销
     return;
@@ -735,7 +749,7 @@ send_to_godot(inner.c_str(), inner.size());
 ```cpp
 // Gstreamer/pipeline.cpp — build_pipeline_desc()
 "appsrc name=godotsrc is-live=true format=time do-timestamp=true "
-"caps=video/x-raw,format=RGBA,width=" FRAME_WIDTH ",height=" FRAME_HEIGHT
+"caps=video/x-raw,format=RGB,width=" FRAME_WIDTH ",height=" FRAME_HEIGHT
     ",framerate=" FRAME_FPS "/1 ! "
 // 队列：max-size-buffers=1 leaky=downstream — 满时丢弃旧帧而非阻塞
 "queue max-size-bytes=0 max-size-buffers=1 max-size-time=0 leaky=downstream ! "
@@ -818,8 +832,12 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 ```json
 // config.json — 单一配置源
 {
-  "video": { "width": 1920, "height": 1080, "fps": 30, "codec": "h264_nvenc" },
+  "video": { "width": 1920, "height": 1080, "fps": 60 },
   "godot": { "gstreamer_host": "127.0.0.1", "tcp_port": 9002 },
+  "encoding": {
+    "type": "nvenc", "codec": "h264", "encoder": "nvautogpuh264enc",
+    "bitrate_kbps": 15000, "preset": "low-latency", "rate_control": "cbr"
+  },
   "shm": { "path": "/dev/shm/godot_webrtc_frame" }
 }
 ```
@@ -827,15 +845,15 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 ```cpp
 // 生成的 C++ 编译时常量 (Gstreamer/config.h)
 constexpr int FRAME_WIDTH = 1920;
-constexpr int FRAME_FPS = 30;
+constexpr int FRAME_FPS = 60;
 ```
 
 ```javascript
 // 生成的 JS 常量 (html/config.js)
 const Config = {
+    video: { width: 1920, height: 1080, fps: 60 },
     selfId: 'browser',
-    peerId: 'cpp_sender',
-    signallingUrl: 'wss://localhost:8443/ws'
+    peerId: 'cpp_sender'
 };
 ```
 
@@ -863,7 +881,7 @@ function scheduleReconnect() {
 ```javascript
 // 重连成功后触发 WebRTC 重新协商
 ws.onmessage = async (event) => {
-    if (data.startsWith('SESSION_OK')) {
+    if (event.data.startsWith('SESSION_OK')) {
         ws.send(JSON.stringify({ reset: true }));  // → GStreamer 重建 Pipeline
         return;
     }
@@ -889,12 +907,16 @@ func read_input_commands() -> void:
         if _read_state == 0:
             if tcp.get_available_bytes() < 4: return
             var header_result := tcp.get_data(4)
-            _expected_len = (len_bytes[0] << 24) | (len_bytes[1] << 16)
-                          | (len_bytes[2] << 8)  | len_bytes[3]
+            if header_result[0] != OK: return
+            var len_bytes := header_result[1] as PackedByteArray
+            if len_bytes.size() < 4: return
+            _expected_len = (len_bytes[0] as int) << 24 | (len_bytes[1] as int) << 16
+                          | (len_bytes[2] as int) << 8  | (len_bytes[3] as int)
             _read_state = 1
 
         if tcp.get_available_bytes() < _expected_len: return
         var data_result := tcp.get_data(_expected_len)
+        var data_bytes := data_result[1] as PackedByteArray
         _handle_input_command(data_bytes.get_string_from_utf8())
         _read_state = 0
 ```
@@ -908,21 +930,21 @@ TCP 控制通道协议：4 字节大端长度头 + JSON 负载，与 C++ 端 `se
 当检测到 CUDA/NVENC 可用时，Pipeline 自动走 GPU 零拷贝路径：
 
 ```
-appsrc (CPU RGBA) → cudaupload → cudaconvert → nvh264enc → h264parse → rtph264pay → webrtcbin
+appsrc (CPU RGB) → cudaupload → cudaconvert → nvh264enc → h264parse → rtph264pay → webrtcbin
 ```
 
 ```cpp
 // Gstreamer/pipeline.cpp — build_pipeline_desc()
 if constexpr (ENC_IS_HARDWARE) {
     // cudaupload:  零拷贝上传 CPU 帧到 GPU 显存
-    // cudaconvert: GPU 端 RGBA→NV12 格式转换（nvh264enc 强制要求 NV12）
+    // cudaconvert: GPU 端 RGB→NV12 格式转换（nvh264enc 强制要求 NV12）
     desc << "cudaupload ! cudaconvert ! "
          << ENC_PIPELINE_ELEM << " " << ENC_OPTIONS
          << " ! h264parse ! " << ENC_RTP_PAYLOADER << " ! " << ENC_RTP_CAPS << " ! ";
 }
 ```
 
-与软件 VP8 路径通过 `config.json` 中的 `codec` 字段一键切换。
+与软件 VP8 路径通过 `config.json` 中的 `encoding.type` 字段一键切换。
 
 ---
 

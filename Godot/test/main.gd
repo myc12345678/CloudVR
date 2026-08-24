@@ -234,7 +234,7 @@ func _update_connection_state() -> void:
 #   offset 8:  uint32 frame_size     (当前帧数据字节数)
 #   offset 12: uint8  ready          (0=写入中, 1=写入完成)
 #   offset 13: uint8  padding[3]     (对齐到 16 字节)
-#   offset 16: uint8  data[]         (原始 RGBA8 像素数据)
+#   offset 16: uint8  data[]         (原始 RGB8 像素数据)
 #
 # 写入流程:
 #   1. ready = 0
@@ -270,8 +270,8 @@ func send_frame() -> void:
 		_send_frame_via_shm(data)
 
 
-func _send_frame_via_shm(rgba_data: PackedByteArray) -> void:
-	var sz := rgba_data.size()
+func _send_frame_via_shm(frame_data: PackedByteArray) -> void:
+	var sz := frame_data.size()
 	if sz > SHM_FRAME_MAX_SIZE:
 		push_warning("帧数据过大: %d > %d" % [sz, SHM_FRAME_MAX_SIZE])
 		return
@@ -280,9 +280,9 @@ func _send_frame_via_shm(rgba_data: PackedByteArray) -> void:
 	shm_file.seek(12)
 	shm_file.store_8(0)
 
-	# 2. 写入原始 RGBA 像素数据到 offset 16
+	# 2. 写入原始 RGB 像素数据到 offset 16
 	shm_file.seek(16)
-	shm_file.store_buffer(rgba_data)
+	shm_file.store_buffer(frame_data)
 
 	# 3. 一次性写入完整头信息（counter + frame_size + ready=1）到 offset 0
 	#    减少 seek/store 系统调用：原来 5 次 seek + 3 次 store → 1 次 seek + 1 次 store

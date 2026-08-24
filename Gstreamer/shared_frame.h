@@ -16,11 +16,11 @@
 //   0x000: uint64_t write_counter  (Godot 每写一帧递增)
 //   0x008: uint32_t frame_size     (当前帧数据字节数)
 //   0x00C: uint8_t  ready          (写入完成后置1, 读取时检查)
-//   0x010: uint8_t  data[]         (原始 RGBA8 像素数据)
+//   0x010: uint8_t  data[]         (原始 RGB8 像素数据)
 //
 // Godot 写入流程:
 //   1. ready = 0
-//   2. memcpy(data, raw_rgba, frame_size)
+//   2. memcpy(data, raw_rgb, frame_size)
 //   3. frame_size = size
 //   4. write_counter++
 //   5. ready = 1  (内存屏障确保写入顺序)
@@ -36,7 +36,7 @@
 // Gstreamer 使用 open+mmap 映射同一文件实现零拷贝共享
 // 以下常量现在由 config.h 统一定义（由 scripts/gen_config.py 从 config.json
 // 生成） constexpr const char *SHM_PATH        — 共享内存文件路径 constexpr
-// size_t      SHM_FRAME_MAX_SIZE  — RGBA8 帧数据最大字节数 constexpr size_t
+// size_t      SHM_FRAME_MAX_SIZE  — RGB8 帧数据最大字节数 constexpr size_t
 // SHM_FRAME_HEADER_SIZE — 头部大小(16字节) constexpr size_t      SHM_TOTAL_SIZE
 // — 总大小
 //

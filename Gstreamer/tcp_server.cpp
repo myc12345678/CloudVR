@@ -178,7 +178,7 @@ static void tcp_server_loop() {
 
 // ======================== 共享内存帧读取 ========================
 //
-// 替代 TCP 传输视频帧。Godot 进程将 RGBA 原始像素写入
+// 替代 TCP 传输视频帧。Godot 进程将 RGB 原始像素写入
 // /dev/shm/godot_webrtc_frame，Gstreamer 端零拷贝读取。
 // 读取端自动跳过中间帧（天然帧丢弃），延迟从 TCP 的 ms 级降至 μs 级。
 
@@ -197,7 +197,7 @@ static void shm_reader_loop() {
     uint64_t current = shm_frame->write_counter.load(std::memory_order_acquire);
     if (current == last_counter) {
       // 无新帧时休眠 3ms，避免高频轮询浪费 CPU
-      // 在 30fps 场景下，帧间隔为 33ms，3ms 轮询足够响应且 CPU 开销极低
+      // 在 60fps 场景下，帧间隔为 16.6ms，3ms 轮询足够响应且 CPU 开销极低
       usleep(3000);
       continue;
     }

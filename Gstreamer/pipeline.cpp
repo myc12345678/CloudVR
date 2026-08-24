@@ -88,7 +88,7 @@ static std::string build_pipeline_desc() {
   if constexpr (ENC_IS_HARDWARE) {
     // NVENC 硬件编码路径
     // cudaupload → 零拷贝上传 CPU 帧到 GPU 显存
-    // cudaconvert → GPU 端格式转换（RGBA/I420 → NV12），nvh264enc 强制要求 NV12
+    // cudaconvert → GPU 端格式转换（RGB → NV12），nvh264enc 强制要求 NV12
     // 注意：cudaconvert 必须在 cudaupload 之后、编码器之前，否则编码器收不到
     // NV12 输入
     desc << "cudaupload ! cudaconvert ! " << ENC_PIPELINE_ELEM << " "

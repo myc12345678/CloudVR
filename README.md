@@ -131,7 +131,7 @@ Godot 端已把"网络输入"封装进标准的 Godot 输入体系，**游戏逻
 
 ### 两端分层
 
-- **游戏逻辑（照 Godot 文档）**：`Player.gd` 用 `Input.get_axis()` / `Input.get_vector()` 读取动作；
+- **游戏逻辑（照 Godot 文档）**：`Player.gd` 用标准 `Input` API（`Input.get_axis()`）读取动作；
   动作定义在 `project.godot` 的 `[input]`（四个动作 `move_forward` / `move_back` / `turn_left` / `turn_right`）。
 - **自定义输入桥（需自己维护）**：
   - `NetworkInputRouter`（autoload）把浏览器按键翻译成逻辑动作，再 `Input.action_press()` 注入；
@@ -200,12 +200,9 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 
 ## 配置（机器相关，不入库）
 
-`config.json` 含本机绝对路径与主机名，**已 gitignore**。首次使用时：
-
-```bash
-cp config.json.example config.json   # 把占位路径改成你的实际路径
-python3 scripts/gen_config.py        # 重新生成 Gstreamer/config.h 和 html/config.js
-```
+`config.json` 含本机绝对路径与主机名，**已 gitignore**。克隆/换机器后按上文「一次性的初始化」第 1 步
+复制 `config.json.example` 为 `config.json`，并运行 `python3 scripts/gen_config.py`
+重新生成 `Gstreamer/config.h` 与 `html/config.js` 即可。
 
 > 注意：`config.json` 中的 `nginx.server_name` 与 `html/nginx.conf` 中的 `server_name`
 > 已统一改为 `127.0.0.1`（原域名为 `ar.myc.wiki`，已过期）。浏览器即通过该 IP 访问。
@@ -254,7 +251,7 @@ clone 后只会得到指针而不是真实二进制。
 cd Gstreamer && make
 ```
 
-产物为 `webrtc_sender`（已 gitignore，不入库）。
+产物为 `webrtc_sender`（已 gitignore，不入库）。此命令与「一次性的初始化」第 3 步相同，单列便于快速查找。
 
 ## 常见问题排查
 
