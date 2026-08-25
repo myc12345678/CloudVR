@@ -22,6 +22,7 @@ var frame_interval := 1.0 / TARGET_FPS
 var frame_accumulator := 0.0
 var connected := false
 var _reconnect_timer := 2.0
+var _shm_reopen_timer := 1.0
 
 # 共享内存文件句柄
 var shm_file: FileAccess = null
@@ -156,8 +157,26 @@ func _open_shm() -> void:
 		push_warning("无法打开共享内存: ", path)
 
 
+func _ensure_shm_valid() -> void:
+	# 共享内存文件被外部删除/重建时，自动重新打开，避免写入已 unlink 的陈旧 inode。
+	if shm_file == null:
+		_open_shm()
+		return
+	if not FileAccess.file_exists(SHM_PATH):
+		print("SHM 文件路径不存在，正在重新打开…")
+		shm_file.close()
+		shm_file = null
+		_open_shm()
+
+
 func _process(delta: float) -> void:
 	_update_connection_state()
+
+	# 防御：定时确认共享内存文件路径仍存在（防止外部删除后写到已 unlink 的陈旧 inode）
+	_shm_reopen_timer -= delta
+	if _shm_reopen_timer <= 0.0:
+		_shm_reopen_timer = 1.0
+		_ensure_shm_valid()
 
 	if not connected:
 		_reconnect_timer -= delta

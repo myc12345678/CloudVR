@@ -184,20 +184,98 @@ static void tcp_server_loop() {
 
 static std::thread shm_thread;
 
-static void shm_reader_loop() {
-  if (!shm_frame) {
-    std::cerr << "shm_reader_loop: shm_frame is null" << std::endl;
-    return;
+// 共享内存文件是否已被 Godot 重建（inode 变化）或消失。
+// 只在限频检查时调用，绝不会进入每帧热路径。
+static bool shm_path_replaced() {
+  struct stat path_st{};
+  if (stat(SHM_FRAME_PATH, &path_st) != 0) {
+    return true; // 文件已被删除 → 需要重新打开
   }
+  struct stat fd_st{};
+  if (fstat(shm_fd, &fd_st) != 0) {
+    return true;
+  }
+  return (path_st.st_dev != fd_st.st_dev) || (path_st.st_ino != fd_st.st_ino);
+}
 
+static void shm_reader_loop() {
   uint64_t last_counter = 0;
+  uint64_t last_inode_check = 0;
+
   std::cout << "Shared memory frame reader started" << std::endl;
 
   while (shm_running.load(std::memory_order_acquire)) {
+    // ---- 确保映射存在 / 最新：只在尚未映射或映射失效时执行，不进帧热路径 ----
+    if (!shm_frame) {
+      if (shm_fd >= 0) {
+        close(shm_fd);
+        shm_fd = -1;
+      }
+
+      // Godot 使用 FileAccess 写入普通文件到 /dev/shm，
+      // 因此这里用 open() 而非 shm_open() 打开同一文件。
+      // /dev/shm 是 tmpfs，文件内容即驻留在 RAM 中，mmap 实现零拷贝。
+      shm_fd = open(SHM_FRAME_PATH, O_RDONLY);
+      if (shm_fd < 0) {
+        std::cerr << "open(" << SHM_FRAME_PATH
+                  << ") failed: " << std::strerror(errno)
+                  << " -- waiting for Godot to create it, retrying in 1s"
+                  << std::endl;
+        usleep(1000000);
+        continue;
+      }
+
+      // 检测文件大小是否与编译期 SHM_TOTAL_SIZE 匹配。
+      // 分辨率变更后 Godot 会重建文件；尺寸不符则等 Godot 重建后重试，而非报错退出。
+      struct stat st{};
+      if (fstat(shm_fd, &st) == 0 &&
+          static_cast<size_t>(st.st_size) != SHM_TOTAL_SIZE) {
+        std::cerr << "SHM file size mismatch: file=" << st.st_size
+                  << " expected=" << SHM_TOTAL_SIZE
+                  << " -- waiting for Godot to recreate it, retrying in 1s"
+                  << std::endl;
+        close(shm_fd);
+        shm_fd = -1;
+        usleep(1000000);
+        continue;
+      }
+
+      shm_frame = static_cast<SharedFrameLayout *>(
+          mmap(nullptr, SHM_TOTAL_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0));
+      if (shm_frame == MAP_FAILED) {
+        std::cerr << "mmap failed: " << std::strerror(errno) << std::endl;
+        close(shm_fd);
+        shm_fd = -1;
+        shm_frame = nullptr;
+        usleep(1000000);
+        continue;
+      }
+
+      last_counter = 0;
+      last_inode_check = now_ms();
+      std::cout << "Reading frames from shared memory " << SHM_FRAME_PATH
+                << " (zero-copy, " << SHM_FRAME_MAX_SIZE << " bytes/frame)"
+                << std::endl;
+    }
+
+    // ---- 每帧热路径（与原有逻辑一致，无新增 syscall） ----
     uint64_t current = shm_frame->write_counter.load(std::memory_order_acquire);
     if (current == last_counter) {
-      // 无新帧时休眠 3ms，避免高频轮询浪费 CPU
-      // 在 60fps 场景下，帧间隔为 16.6ms，3ms 轮询足够响应且 CPU 开销极低
+      // 无新帧时休眠 3ms，避免高频轮询浪费 CPU。
+      // 同时做限频的 inode 完整性检查（约 1 次/秒），检测 Godot 重建文件。
+      uint64_t now = now_ms();
+      if (now - last_inode_check >= 1000) {
+        last_inode_check = now;
+        if (shm_path_replaced()) {
+          std::cerr << "SHM file was re-created by Godot, re-opening"
+                    << std::endl;
+          if (shm_frame && shm_frame != MAP_FAILED) {
+            munmap(shm_frame, SHM_TOTAL_SIZE);
+          }
+          shm_frame = nullptr;
+          continue; // 下一轮循环重新打开
+        }
+      }
       usleep(3000);
       continue;
     }
@@ -231,49 +309,8 @@ void start_shm_frame_reader() {
   if (shm_thread.joinable())
     shm_thread.join();
 
-  // Godot 使用 FileAccess 写入普通文件到 /dev/shm，
-  // 因此这里用 open() 而非 shm_open() 打开同一文件。
-  // /dev/shm 是 tmpfs，文件内容即驻留在 RAM 中，mmap 实现零拷贝。
-  shm_fd = open(SHM_FRAME_PATH, O_RDONLY);
-  if (shm_fd < 0) {
-    std::cerr << "open(" << SHM_FRAME_PATH
-              << ") failed: " << std::strerror(errno)
-              << " -- falling back to TCP (start Godot first)" << std::endl;
-    return;
-  }
-
-  // 检测文件大小是否与编译期 SHM_TOTAL_SIZE 匹配
-  // 分辨率变更后 Godot 会重建文件，但若本进程抢先打开旧文件则需报错退出
-  {
-    struct stat st{};
-    if (fstat(shm_fd, &st) == 0) {
-      if (static_cast<size_t>(st.st_size) != SHM_TOTAL_SIZE) {
-        std::cerr << "SHM file size mismatch: file=" << st.st_size
-                  << " expected=" << SHM_TOTAL_SIZE
-                  << " -- please restart both Godot and GStreamer to sync"
-                  << std::endl;
-        close(shm_fd);
-        shm_fd = -1;
-        return;
-      }
-    }
-  }
-
-  shm_frame = static_cast<SharedFrameLayout *>(
-      mmap(nullptr, SHM_TOTAL_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0));
-  if (shm_frame == MAP_FAILED) {
-    std::cerr << "mmap failed: " << std::strerror(errno) << std::endl;
-    close(shm_fd);
-    shm_fd = -1;
-    shm_frame = nullptr;
-    return;
-  }
-
   shm_running = true;
   shm_thread = std::thread(shm_reader_loop);
-  std::cout << "Reading frames from shared memory " << SHM_FRAME_PATH
-            << " (zero-copy, " << SHM_FRAME_MAX_SIZE << " bytes/frame)"
-            << std::endl;
 }
 
 void stop_shm_frame_reader() {

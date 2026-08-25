@@ -49,7 +49,7 @@ cd ../..
 
 ## 启动流程（完整）
 
-系统由 **4 个常驻进程 + 1 个浏览器** 组成。**启动顺序有严格要求**（见下方“注意”）。
+系统由 **4 个常驻进程 + 1 个浏览器** 组成。各组件**可任意顺序启动，均会自动衔接**（见下方“启动顺序”）。
 
 ### 第 1 步：信令服务器（wss://0.0.0.0:8443）
 
@@ -95,21 +95,22 @@ cd Gstreamer && ./webrtc_sender
 
 ---
 
-### 启动顺序（关键！）
+### 启动顺序（已与先后解耦，无强制顺序）
 
-`webrtc_sender` 的 `start_shm_frame_reader()` 只在**启动时**打开一次
-`/dev/shm/godot_webrtc_frame`。因此：
+各组件**不依赖启动顺序**，可任意先后启动，均能自动衔接：
 
-1. **先启动 Godot**（它 `_ready()` 里就会创建该共享内存文件）；
-2. **再启动 `webrtc_sender`**（此时 shm 文件已存在，才会真正读帧）；
-3. **最后打开浏览器**（作为 `browser` 对端完成 WebRTC 协商）。
+- **共享内存帧**：`webrtc_sender` 的读帧线程会在 `/dev/shm/godot_webrtc_frame` 不存在时
+  每 1 秒重试打开。因此无论 Godot 先起还是 sender 先起，只要文件一出现，sender 就会
+  自动读取；Godot 运行中途重建该文件（分辨率变更 / 重启）也会被 sender 自动跟随
+  （限频约 1 秒检测一次 inode，发现变化即重新打开，无需重启 sender）。
+- **信令 WebSocket**：sender 在信令服务器未启动或中途断开时**不会退出**，而是按
+  `1s→2s→4s→…→30s` 退避在后台重连；重新连上后会自动重新声明 `SESSION browser`
+  并触发重新协商。浏览器端本身就带指数退避重连。
+- **TCP 控制通道**：Godot 每 2 秒重连 sender 的 TCP `9002`，天然无先后依赖。
 
-如果先启动 sender 再启动 Godot，sender 会打印
-`open(/dev/shm/godot_webrtc_frame) failed ... falling back to TCP (start Godot first)`
-并**一直读不到帧**（除非重启 sender）。
-
-> Godot 会在 `_process()` 中每 2 秒重试连接 sender 的 TCP `9002`，所以只要
-> sender 稍后起来，Godot 会自动连上并开始写帧，无需手动干预。
+> 旧版本曾要求“先 Godot → 再 sender → 最后浏览器”。现在无需遵守该顺序。
+> 唯一仍属“协商”性质的耦合是 WebRTC 的 offer/answer（浏览器作为对端），
+> 但这一点由浏览器连上后发送 `{reset}`、以及 sender 重连后重新协商自动兜底。
 
 ---
 
@@ -257,9 +258,11 @@ cd Gstreamer && make
 
 | 现象 | 原因 / 解决 |
 |------|------|
-| `open(/dev/shm/godot_webrtc_frame) failed ... falling back to TCP (start Godot first)` | sender 抢在 Godot 前启动，shm 文件还没创建。先启动 Godot，再启动 sender。 |
-| `SHM file size mismatch ... restart both Godot and GStreamer` | 分辨率改变后 shm 文件大小不一致；重启 Godot 和 sender。 |
-| 信令日志一直 `Peer X not connected` | 目标对端还没连上信令：浏览器未打开，或发送端未注册为 `cpp_sender`。 |
+| `open(/dev/shm/godot_webrtc_frame) failed ... retrying in 1s` | **正常自愈过程**：Godot 尚未创建 shm 文件。sender 会每 1 秒重试，文件出现后自动开始读帧；无需重启任何进程。 |
+| `SHM file size mismatch ... retrying in 1s` | **正常自愈过程**：Godot 将按新分辨率重建 shm 文件；sender 检测到尺寸/ inode 变化后自动重新打开。若几十秒后仍无画面，检查配置是否已在设备/重启后同步。 |
+| `SHM file was re-created by Godot, re-opening` | **自愈成功的日志**：sender 检测到 Godot 重建了文件并已自动重新映射，无需干预。 |
+| `Reconnecting to signalling server in Ns` | **正常的自动重连**：程序未退出，会退避重连；请确认信令服务器已启动。 |
+| 信令日志一直 `Peer X not connected` | 目标对端还没连上信令：浏览器未打开，或发送端未注册为 `cpp_sender`。各端连上后会自动重新协商。 |
 | 浏览器弹“连接不安全” | 自签证书未被信任；导入 `dev-cert.pem` 或在告警页点“继续”。 |
 | `nvautogpuh264enc` 初始化失败 / `nvidia-smi` 报错 | 无 NVIDIA GPU 或驱动；改用软件编码（改 `config.json` 的 `encoding`）。 |
 | Godot「未找到 config.json，使用内置默认值」 | 属正常回退（Godot 用内置默认值，与 `config.json` 一致），不影响运行。 |

@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include <chrono>
+
 // ======================== 全局状态定义 ========================
 
 GMainLoop *loop = nullptr;
@@ -23,3 +25,11 @@ std::atomic<uint64_t> frame_counter{0};
 int shm_fd = -1;
 SharedFrameLayout *shm_frame = nullptr;
 std::atomic<bool> shm_running{false};
+
+std::atomic<bool> shutting_down{false};
+
+uint64_t now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}

@@ -40,4 +40,10 @@ extern int shm_fd;
 extern SharedFrameLayout *shm_frame;
 extern std::atomic<bool> shm_running;
 
+// 全局关停标志：由信号处理器置位，用于停止所有后台重连调度
+extern std::atomic<bool> shutting_down;
+
+// 单调时钟毫秒值（用于对重连 / 自愈操作限频）
+uint64_t now_ms();
+
 #endif // COMMON_H

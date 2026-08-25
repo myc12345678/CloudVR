@@ -38,21 +38,56 @@ void push_jpeg_frame_to_appsrc(const uint8_t *data, size_t size) {
   push_raw_frame_to_appsrc(data, size);
 }
 
+// ======================== 管线错误自复位 ========================
+// 为避免编码器 / 管线出现瞬时错误就终止整个 sender，这里在 ERROR/EOS 时
+// 带冷却、带次数上限地重建管线；若持续失败则保持运行并打印降级日志，
+// 而不是退出进程（配合信令自动重连，做到不易崩溃）。
+
+static const unsigned MAX_PIPELINE_RESETS = 5;
+static unsigned pipeline_error_resets = 0;
+
+static void maybe_reset_pipeline() {
+  static uint64_t last_reset_ms = 0;
+  uint64_t now = now_ms();
+
+  if (pipeline_error_resets >= MAX_PIPELINE_RESETS) {
+    std::cerr << "Pipeline error persists; auto-reset disabled ("
+              << pipeline_error_resets << " resets). Staying running."
+              << std::endl;
+    return;
+  }
+  if (now - last_reset_ms < 3000) { // 3s 冷却，避免反复自旋
+    std::cerr << "Pipeline error too soon after last reset; backing off."
+              << std::endl;
+    return;
+  }
+
+  last_reset_ms = now;
+  pipeline_error_resets++;
+  std::cerr << "Resetting pipeline (attempt " << pipeline_error_resets << "/"
+            << MAX_PIPELINE_RESETS << ")..." << std::endl;
+  stop_pipeline();
+  start_pipeline();
+}
+
 static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer /*data*/) {
   switch (GST_MESSAGE_TYPE(msg)) {
   case GST_MESSAGE_ERROR: {
     GError *err;
     gchar *debug;
     gst_message_parse_error(msg, &err, &debug);
-    std::cerr << "ERROR: " << err->message << std::endl;
+    std::cerr << "Pipeline ERROR: " << err->message << std::endl;
+    if (debug)
+      std::cerr << "  debug: " << debug << std::endl;
     g_error_free(err);
     g_free(debug);
-    g_main_loop_quit(loop);
+    // 不再直接退出进程，改为带冷却地自复位管线（可自愈瞬时错误）。
+    maybe_reset_pipeline();
     break;
   }
   case GST_MESSAGE_EOS:
-    std::cout << "EOS" << std::endl;
-    g_main_loop_quit(loop);
+    std::cout << "EOS (end of stream)" << std::endl;
+    maybe_reset_pipeline();
     break;
   default:
     break;

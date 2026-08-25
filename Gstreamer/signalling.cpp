@@ -1,5 +1,7 @@
 #include "signalling.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <gst/sdp/sdp.h>
 #include <gst/webrtc/webrtc.h>
@@ -9,6 +11,17 @@
 #include "common.h"
 #include "pipeline.h"
 #include "tcp_server.h"
+
+// ---- 信令重连状态（文件内私有） ----
+// 这些只在主循环线程访问，无需原子；websocket 连接完成标志也仅主循环线程读写。
+static unsigned sign_reconnect_attempts = 0;
+static guint sign_reconnect_source = 0;
+static bool ws_handshake_done = false;
+
+// 前向声明（互相调用）
+static void schedule_signalling_reconnect();
+static gboolean try_connect_signalling(gpointer);
+static void start_signalling_connect();
 
 // ======================== JSON 工具 ========================
 
@@ -275,6 +288,10 @@ static void on_ws_message(SoupWebsocketConnection *,
     if (!session_started) {
       send_text("SESSION " + peer_id);
       session_started = true;
+      // 握手完成后强制重新协商，保证无论哪一端先启动都能重新发出 offer，
+      // 覆盖“先开 sender 后开浏览器 / sender 单独重连”等所有时序。
+      stop_pipeline();
+      start_pipeline();
     }
     return;
   }
@@ -293,9 +310,18 @@ static void on_ws_message(SoupWebsocketConnection *,
   }
 }
 
-static void on_ws_closed(SoupWebsocketConnection *, gpointer) {
+static void on_ws_closed(SoupWebsocketConnection *conn, gpointer) {
   std::cout << "WebSocket closed" << std::endl;
-  g_main_loop_quit(loop);
+  if (conn) {
+    g_signal_handlers_disconnect_by_data(conn, nullptr);
+    g_object_unref(conn);
+  }
+  ws_conn = nullptr;
+  ws_handshake_done = false;
+  session_started = false;
+  if (!shutting_down.load()) {
+    schedule_signalling_reconnect();
+  }
 }
 
 static gboolean on_accept_certificate(SoupMessage *, GTlsCertificate *,
@@ -316,11 +342,16 @@ static void on_server_connected(GObject *, GAsyncResult *res,
   if (error) {
     std::cerr << "WebSocket connect failed: " << error->message << std::endl;
     g_error_free(error);
-    g_main_loop_quit(loop);
+    ws_conn = nullptr;
+    if (!shutting_down.load()) {
+      schedule_signalling_reconnect();
+    }
     return;
   }
 
   std::cout << "WebSocket connected" << std::endl;
+  sign_reconnect_attempts = 0;
+  ws_handshake_done = true;
 
   g_signal_connect(ws_conn, "message", G_CALLBACK(on_ws_message), nullptr);
   g_signal_connect(ws_conn, "closed", G_CALLBACK(on_ws_closed), nullptr);
@@ -337,22 +368,67 @@ void connect_webrtc_signals(GstElement *webrtc) {
                    nullptr);
 }
 
-void connect_to_signalling_server() {
-  GError *tls_error = nullptr;
-  GTlsDatabase *tls_db =
-      g_tls_file_database_new(SIGNALLING_CA_PATH, &tls_error);
-  if (!tls_db) {
-    std::cerr << "Failed to load TLS CA file: " << SIGNALLING_CA_PATH
-              << " error=" << (tls_error ? tls_error->message : "unknown")
-              << std::endl;
-    if (tls_error)
-      g_error_free(tls_error);
-    return;
-  }
+// ======================== 信令连接 / 自动重连 ========================
+//
+// 设计目标：sender 不依赖信令服务器的启动顺序。
+// 任何时候连接失败或 WebSocket 断开，都不会退出进程，而是带退避地
+// 后台重连；握手完成后重新声明 SESSION 并强制重新协商，保证对端能接收 offer。
 
-  soup_session = soup_session_new();
-  soup_session_set_tls_database(soup_session, tls_db);
-  g_object_unref(tls_db);
+static const unsigned SIGNAL_RECONNECT_MAX_DELAY_S = 30;
+
+// 调度一次带退避的重连（幂等：已有一个待触发的重连则忽略）
+static void schedule_signalling_reconnect() {
+  if (shutting_down.load())
+    return;
+  if (sign_reconnect_source != 0)
+    return;
+
+  unsigned delay_s =
+      sign_reconnect_attempts >= 5
+          ? SIGNAL_RECONNECT_MAX_DELAY_S
+          : (1u << sign_reconnect_attempts); // 1,2,4,8,16 → 封顶 30s
+  sign_reconnect_attempts++;
+  std::cout << "Reconnecting to signalling server in " << delay_s << "s"
+            << std::endl;
+  sign_reconnect_source =
+      g_timeout_add_seconds(delay_s, try_connect_signalling, nullptr);
+}
+
+static gboolean try_connect_signalling(gpointer) {
+  sign_reconnect_source = 0;
+  if (shutting_down.load())
+    return G_SOURCE_REMOVE;
+  start_signalling_connect();
+  return G_SOURCE_REMOVE;
+}
+
+void connect_to_signalling_server() {
+  start_signalling_connect();
+}
+
+static void start_signalling_connect() {
+  if (shutting_down.load())
+    return;
+  if (ws_handshake_done)
+    return; // 已连接
+
+  if (!soup_session) {
+    GError *tls_error = nullptr;
+    GTlsDatabase *tls_db =
+        g_tls_file_database_new(SIGNALLING_CA_PATH, &tls_error);
+    if (!tls_db) {
+      std::cerr << "Failed to load TLS CA file: " << SIGNALLING_CA_PATH
+                << " error=" << (tls_error ? tls_error->message : "unknown")
+                << std::endl;
+      if (tls_error)
+        g_error_free(tls_error);
+      schedule_signalling_reconnect();
+      return;
+    }
+    soup_session = soup_session_new();
+    soup_session_set_tls_database(soup_session, tls_db);
+    g_object_unref(tls_db);
+  }
 
   SoupMessage *msg = soup_message_new("GET", SIGNALLING_URL);
   g_signal_connect(msg, "accept-certificate", G_CALLBACK(on_accept_certificate),

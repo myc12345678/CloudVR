@@ -487,10 +487,11 @@ make                                # 编译 webrtc_sender
 
 ### 4.3 启动顺序
 
-> **顺序关键**：`webrtc_sender` 的 `start_shm_frame_reader()` 只在**启动时**打开一次
-> `/dev/shm/godot_webrtc_frame`。因此必须**先启动 Godot**（其 `_ready()` 会创建该共享内存文件），
-> **再启动 GStreamer 发送端**；否则 sender 会报
-> `open(...) failed ... falling back to TCP (start Godot first)` 并读不到帧。
+> **已与先后解耦**：`webrtc_sender` 的 `start_shm_frame_reader()` 现在在一个常驻读帧线程里
+> 执行，`/dev/shm/godot_webrtc_frame` 不存在时会**每 1 秒重试打开**；Godot 运行中途
+> 重建该文件（分辨率变更 / 重启）也会被 sender 通过限频 inode 检测自动跟随。因此
+> **不再强制“先 Godot 再 sender”**。信令 WebSocket 在服务器未起/断开时也**不会退出**，
+> 而是带退避重连。下方步骤仅为“典型顺序”，任意顺序均可启动、自动衔接。
 
 ```bash
 # 1. 启动 Signalling Server
@@ -499,11 +500,11 @@ node signalling-server/server.js &
 # 2. (可选) 启动 Nginx
 #    nginx -c html/nginx.conf
 
-# 3. 启动 Godot 游戏项目（先于 GStreamer，创建共享内存帧）
+# 3. 启动 Godot 游戏项目（创建共享内存帧；即使后起，sender 也会重试等待）
 #    在 Godot 编辑器中打开 Godot/test/project.godot 并运行
 #    或命令行（推荐用脚本强制 NVIDIA 独显）：./scripts/run_godot.sh
 
-# 4. 启动 GStreamer 发送端（此时 shm 文件已存在，才会真正读帧）
+# 4. 启动 GStreamer 发送端（shm 已存在则立即读帧；未存在则重试，无需重启）
 cd Gstreamer && ./webrtc_sender &
 
 # 5. 浏览器访问
@@ -682,7 +683,9 @@ while (shm_running.load(std::memory_order_acquire)) {
 **mmap 映射：**
 
 ```cpp
-// Gstreamer/tcp_server.cpp — start_shm_frame_reader()
+// Gstreamer/tcp_server.cpp — shm_reader_loop() 内的“打开/校验/mmap”分支
+// 注：该段现在运行在读帧线程内部，且仅在 shm_frame 为空（尚未连接/被重建）时执行，
+// 不进每帧热路径。失败时 usleep(1s) 重试，而非报错退出。
 shm_fd = open(SHM_FRAME_PATH, O_RDONLY);          // /dev/shm 是 tmpfs
 shm_frame = static_cast<SharedFrameLayout *>(
     mmap(nullptr, SHM_TOTAL_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0));
