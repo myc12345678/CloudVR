@@ -174,13 +174,13 @@ Godot 端已把"网络输入"封装进标准的 Godot 输入体系，**游戏逻
 nginx -s stop -c "$(pwd)/html/nginx.conf"
 
 # 2) 结束 Godot（run_godot.sh 前台运行时按 Ctrl+C 即可；否则按 PID 结束）
-pkill -f 'godot --path' 2>/dev/null || true
+pkill -f '[g]odot --path' 2>/dev/null || true
 
 # 3) 结束 GStreamer 发送端
-pkill -f webrtc_sender 2>/dev/null || true
+pkill -f '[w]ebrtc_sender' 2>/dev/null || true
 
 # 4) 结束信令服务器
-pkill -f 'node server.js' 2>/dev/null || true
+pkill -f '[n]ode server\.js' 2>/dev/null || true
 
 # 5) 删除共享内存帧文件（下次启动会重新创建）
 rm -f /dev/shm/godot_webrtc_frame
@@ -198,6 +198,9 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 > 说明：`node server.js` / `webrtc_sender` / `godot` 若在前台终端运行，直接 `Ctrl+C`
 > 即可退出；上表用 `pkill` 是为了脚本化关闭。`/dev/shm` 里的是共享内存帧文件，
 > 退出后残留不影响下次启动（Godot 启动时会重新创建）。
+>
+> 小贴士：上面 `pkill -f` 用 `[w]ebrtc_sender` 这类“字符类”写法，是为了让模式**不会匹配到
+> pkill 自身的命令行**（否则在 `bash -c` 或脚本里运行会把自己也 kill 掉）。请保留此写法。
 
 ## 配置（机器相关，不入库）
 
