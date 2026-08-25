@@ -37,3 +37,6 @@ signalling-server/certs/*
 *.bak
 *.swp
 *~
+
+# ---- 毕业设计文档（本地生成，整个目录不进入仓库）----
+thesis/
