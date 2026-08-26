@@ -141,18 +141,18 @@
 
 ## 3. 详细模块说明
 
-### 3.1 配置系统 (`config.json` + `scripts/gen_config.py`)
+### 3.1 配置系统 (`config.json`，运行时读取)
 
-**单一配置源原则**：所有可调参数集中在项目根目录 `config.json`，通过 Python 脚本生成各语言的常量文件。
+**单一配置源原则**：所有可调参数集中在项目根目录 `config.json`。各子系统在**运行时**直接读取该文件，
+无需重新编译或生成常量文件。
 
 ```
 config.json
     │
-    ├── scripts/gen_config.py ──→ Gstreamer/config.h     (C++ constexpr 常量)
-    │                        ──→ html/config.js           (JavaScript Config 对象)
-    │
-    ├── signalling-server/server.js                       (运行时直接读取)
-    └── Godot/test/main.gd                                (运行时直接读取)
+    ├── Gstreamer/config.cpp  ──→ 启动时用 json-glib 解析（填充 Gstreamer/config.h 的 Config）
+    ├── html/script.js        ──→ 页面启动时 fetch('/config.json')（nginx 暴露）
+    ├── signalling-server/server.js ──→ 启动时直接读取
+    └── Godot/test/main.gd    ──→ 启动时直接读取
 ```
 
 **关键配置项**：
@@ -481,8 +481,7 @@ _physics_process(delta):
 
 ```bash
 cd Gstreamer
-python3 ../scripts/gen_config.py   # 从 config.json 生成 config.h + config.js
-make                                # 编译 webrtc_sender
+make                                # 编译 webrtc_sender（配置在运行时从 config.json 读取）
 ```
 
 ### 4.3 启动顺序
@@ -514,11 +513,12 @@ cd Gstreamer && ./webrtc_sender &
 
 ### 4.4 配置调整
 
-修改 `config.json` 后需重新生成常量文件：
+`config.json` 在运行时被各子系统读取，修改后**无需重新编译**，只需重启对应进程
+（浏览器刷新页面即可）：
 
 ```bash
-python3 scripts/gen_config.py
-cd Gstreamer && make
+# GStreamer sender（自动在运行时重新解析 config.json）
+cd Gstreamer && ./webrtc_sender
 ```
 
 ---
@@ -558,27 +558,26 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 
 ```
 /home/myc/develop/test/
-├── config.json                          # 单一配置源
+├── config.json                          # 单一配置源（运行时读取）
 ├── scripts/
-│   └── gen_config.py                    # 配置代码生成器
+│   └── run_godot.sh                     # 强制用 NVIDIA 独显启动 Godot
 ├── Gstreamer/
-│   ├── main.cpp                         # 入口
+│   ├── main.cpp                         # 入口（启动时加载 config.json）
+│   ├── config.cpp / config.h            # 运行时配置解析（json-glib）+ Config 结构
 │   ├── pipeline.cpp / pipeline.h        # GStreamer Pipeline 构建
 │   ├── signalling.cpp / signalling.h    # WebRTC 信令 + WebSocket
 │   ├── tcp_server.cpp / tcp_server.h    # TCP 控制 + 共享内存读取
 │   ├── common.cpp / common.h            # 全局状态
-│   ├── shared_frame.h                   # 共享内存数据布局
-│   ├── config.h                         # 生成的编译时常量
+│   ├── shared_frame.h                   # 共享内存数据布局（头部固定 16 字节）
 │   └── Makefile                         # 编译脚本
 ├── signalling-server/
 │   ├── server.js                        # 纯 Node.js 信令服务器
 │   └── certs/                           # TLS 证书
 ├── html/
 │   ├── test.html                        # 前端页面
-│   ├── script.js                        # WebRTC 客户端 + 输入捕获
+│   ├── script.js                        # WebRTC 客户端 + 输入捕获（运行时 fetch config.json）
 │   ├── style.css                        # 样式
-│   ├── config.js                        # 生成的 JS 常量
-│   └── nginx.conf                       # Nginx 配置
+│   └── nginx.conf                       # Nginx 配置（在 /config.json 暴露配置）
 └── Godot/
     └── test/
         ├── project.godot                # Godot 项目文件
@@ -823,14 +822,9 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 
 ---
 
-### 8.6 配置驱动架构
+### 8.6 配置驱动架构（运行时读取）
 
-单一 `config.json` → Python 脚本 → C++/JS/GDScript 多语言常量生成：
-
-```python
-# scripts/gen_config.py (核心逻辑)
-# 从 config.json 读取 → 生成 Gstreamer/config.h 和 html/config.js
-```
+各子系统在启动时直接读取同一个 `config.json`，无需编译期生成步骤：
 
 ```json
 // config.json — 单一配置源
@@ -846,21 +840,17 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 ```
 
 ```cpp
-// 生成的 C++ 编译时常量 (Gstreamer/config.h)
-constexpr int FRAME_WIDTH = 1920;
-constexpr int FRAME_FPS = 60;
+// Gstreamer/config.cpp — 启动时用 json-glib 解析 config.json，填充全局 Config
+Config g_config;                       // 运行时全局配置（见 Gstreamer/config.h）
+bool load_config(Config &cfg, const std::string &path);
 ```
 
 ```javascript
-// 生成的 JS 常量 (html/config.js)
-const Config = {
-    video: { width: 1920, height: 1080, fps: 60 },
-    selfId: 'browser',
-    peerId: 'cpp_sender'
-};
+// html/script.js — 页面启动时 fetch('/config.json')（nginx 暴露）
+await loadRuntimeConfig();             // 读取 gstreamer.self_id / peer_id
 ```
 
-修改 `config.json` 后运行 `python3 scripts/gen_config.py && cd Gstreamer && make` 即可同步所有组件。
+修改 `config.json` 后只需重启对应进程（浏览器刷新页面），无需重新编译。
 
 ---
 
@@ -938,12 +928,13 @@ appsrc (CPU RGB) → cudaupload → cudaconvert → nvh264enc → h264parse → 
 
 ```cpp
 // Gstreamer/pipeline.cpp — build_pipeline_desc()
-if constexpr (ENC_IS_HARDWARE) {
+if (g_config.enc_is_hardware) {
     // cudaupload:  零拷贝上传 CPU 帧到 GPU 显存
     // cudaconvert: GPU 端 RGB→NV12 格式转换（nvh264enc 强制要求 NV12）
     desc << "cudaupload ! cudaconvert ! "
-         << ENC_PIPELINE_ELEM << " " << ENC_OPTIONS
-         << " ! h264parse ! " << ENC_RTP_PAYLOADER << " ! " << ENC_RTP_CAPS << " ! ";
+         << g_config.enc_pipeline_elem << " " << g_config.enc_options
+         << " ! h264parse ! " << g_config.enc_rtp_payloader << " ! "
+         << g_config.enc_rtp_caps << " ! ";
 }
 ```
 

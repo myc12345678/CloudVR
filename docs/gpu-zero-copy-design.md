@@ -37,7 +37,7 @@ SubViewport 离线渲染 → GPU 显存
 | 共享内存布局 | `Gstreamer/shared_frame.h`、`Godot/test/main.gd` `_send_frame_via_shm()` |
 | Godot 回读 + 写帧 | `Godot/test/main.gd` `send_frame()` / `_send_frame_via_shm()` |
 | GStreamer 读帧线程 | `Gstreamer/tcp_server.cpp` `shm_reader_loop()` |
-| 管线描述 | `Gstreamer/pipeline.cpp` `build_pipeline_desc()`、`config.h`（由 `config.json` 生成） |
+| 管线描述 | `Gstreamer/pipeline.cpp` `build_pipeline_desc()`、`config.cpp`（运行时从 `config.json` 读取配置） |
 
 ---
 
@@ -293,10 +293,10 @@ SHM 那套"写最后一帧、读者拿最新"在 GPU 上**不成立**：Godot �
 | `Gstreamer/pipeline.cpp` | 管线从 `cudaupload+cudaconvert` 换为 `glupload+glcolorconvert`，appsrc caps 改 `memory:DMABuf,format=DMA_DRM,drm-format=...` |
 | `Gstreamer/tcp_server.cpp` `shm_reader_loop()` | 从读像素改为读 `buffer_index` → 导入 GPU 帧 → `push_gpu_frame`；编码完成后写回 released |
 | `Gstreamer/shared_frame.h` | 扩展：增加 `buffer_index` 字段（或复用头部 padding），定义环形/released 语义 |
-| `Gstreamer/config.h`（gen 生成） | 增加 dma-buf / 缓冲 N 等配置项 |
+| `Gstreamer/config.cpp` / `config.h`（运行时读取） | 增加 dma-buf / 缓冲 N 等配置项 |
 | `Gstreamer/main.cpp` | 增加 fd 接收（SCM_RIGHTS unix socket）初始化 |
 | `Godot/test/main.gd` | `send_frame()` 改为：渲染→`texture_copy`→写 `buffer_index`/`write_counter`；`_send_frame_via_shm` 调整（或走 C+ 异步读回） |
-| `scripts/gen_config.py` / `config.json` | 增加相关配置项 |
+| `config.json`（运行时读取） | 增加相关配置项（各子系统启动时读取） |
 | 文档 | 本文件 + README/TECHNICAL 更新 |
 
 ---

@@ -1,7 +1,9 @@
 const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${wsScheme}//${location.host}/ws`;
-const selfId = (typeof Config !== 'undefined' && Config.selfId) || 'browser';
-const peerId = (typeof Config !== 'undefined' && Config.peerId) || 'cpp_sender';
+
+// 运行时从 config.json 加载（由 nginx 在 /config.json 暴露）。默认值兜底。
+let selfId = 'browser';
+let peerId = 'cpp_sender';
 
 const logBox = document.getElementById('logBox');
 const heroStatus = document.getElementById('heroStatus');
@@ -21,11 +23,25 @@ const videoDot = document.getElementById('videoDot');
 
 const video = document.getElementById('remoteVideo');
 
-document.getElementById('wsUrlText').textContent = wsUrl;
-document.getElementById('selfIdText').textContent = selfId;
-document.getElementById('peerIdText').textContent = peerId;
-document.getElementById('peerLabel').textContent = peerId;
-document.getElementById('selfLabel').textContent = selfId;
+async function loadRuntimeConfig() {
+  try {
+    const resp = await fetch('config.json', { cache: 'no-store' });
+    if (resp.ok) {
+      const cfg = await resp.json();
+      const g = cfg && cfg.gstreamer;
+      if (g) {
+        // 浏览器自身 ID 是 sender 的 peer，目标 peer 是 sender 的 self
+        if (g.peer_id) selfId = g.peer_id;
+        if (g.self_id) peerId = g.self_id;
+        console.log('[config] 已从 config.json 加载运行时配置', { selfId, peerId });
+      }
+    } else {
+      console.warn('[config] 读取 config.json 失败 HTTP ' + resp.status + '，使用内置默认值');
+    }
+  } catch (e) {
+    console.warn('[config] 加载 config.json 失败，使用内置默认值', e);
+  }
+}
 
 let ws = null;
 let pc = null;
@@ -372,11 +388,23 @@ document.getElementById('clearLogButton').onclick = () => {
   log('\u65E5\u5FD7\u5DF2\u6E05\u7A7A');
 };
 
-setStatus(wsStatusEl, wsDot, 'connecting');
-setStatus(pcStatusEl, pcDot, 'new');
-setStatus(iceStatusEl, iceDot, 'new');
-setStatus(videoStatusEl, videoDot, 'idle');
-connectWebSocket();
+// ========== 启动：先加载运行时配置（config.json），再连接信令 ==========
+async function init() {
+  await loadRuntimeConfig();
+
+  document.getElementById('wsUrlText').textContent = wsUrl;
+  document.getElementById('selfIdText').textContent = selfId;
+  document.getElementById('peerIdText').textContent = peerId;
+  document.getElementById('peerLabel').textContent = peerId;
+  document.getElementById('selfLabel').textContent = selfId;
+
+  setStatus(wsStatusEl, wsDot, 'connecting');
+  setStatus(pcStatusEl, pcDot, 'new');
+  setStatus(iceStatusEl, iceDot, 'new');
+  setStatus(videoStatusEl, videoDot, 'idle');
+  connectWebSocket();
+}
+init();
 
 // ========== 用户输入回传 ==========
 function sendInput(type, data) {

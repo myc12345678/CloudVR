@@ -9,13 +9,14 @@
 
 // ======================== 共享内存帧格式 ========================
 //
-// Godot 进程写入，Gstreamer 进程读取（零拷贝）
-// 共享内存文件: /dev/shm/godot_webrtc_frame
+// Godot 进程写入，Gstreamer 进程读取（零拷贝）。
+// 共享内存文件路径: g_config.shm_path（运行期读取 config.json）。
 //
-// 布局:
+// 头部固定 16 字节（与 Godot 端字节布局完全一致），数据紧随其后：
 //   0x000: uint64_t write_counter  (Godot 每写一帧递增)
 //   0x008: uint32_t frame_size     (当前帧数据字节数)
 //   0x00C: uint8_t  ready          (写入完成后置1, 读取时检查)
+//   0x00D: uint8_t  padding[3]     (对齐到 16 字节)
 //   0x010: uint8_t  data[]         (原始 RGB8 像素数据)
 //
 // Godot 写入流程:
@@ -31,30 +32,27 @@
 //   3. while (!ready) spin (极短等待)
 //   4. push_raw_frame_to_appsrc(data, frame_size)
 //   5. last_read = wc (自动跳过中间帧)
-
-// Godot 使用 FileAccess 读写 /dev/shm 中的普通文件（非 POSIX shm）
-// Gstreamer 使用 open+mmap 映射同一文件实现零拷贝共享
-// 以下常量现在由 config.h 统一定义（由 scripts/gen_config.py 从 config.json
-// 生成） constexpr const char *SHM_PATH        — 共享内存文件路径 constexpr
-// size_t      SHM_FRAME_MAX_SIZE  — RGB8 帧数据最大字节数 constexpr size_t
-// SHM_FRAME_HEADER_SIZE — 头部大小(16字节) constexpr size_t      SHM_TOTAL_SIZE
-// — 总大小
 //
-// 与 Godot 端通信时请使用 SHM_PATH 替代旧的 SHM_FRAME_PATH：
-#define SHM_FRAME_PATH SHM_PATH
+// 运行期分辨率：data 区域的实际字节数 = frame_width * frame_height * 3
+// （见 g_config.shm_frame_max_size），因此在打开文件时校验文件大小是否匹配，
+// 分辨率变更后 Godot 会重建文件，sender 检测到 inode/大小变化后自动重新映射。
 
-// shared memory 内的数据结构（必须与 Godot 端字节布局一致）
-struct SharedFrameLayout {
-  std::atomic<uint64_t> write_counter;
-  std::atomic<uint32_t> frame_size;
-  std::atomic<uint8_t> ready;
-  uint8_t padding[3]; // 对齐到 16 字节
-  uint8_t data[SHM_FRAME_MAX_SIZE];
+// 头部结构（仅 16 字节，与 Godot 端像素布局一致）
+struct SharedFrameHeader {
+  std::atomic<uint64_t> write_counter; // offset 0x000
+  std::atomic<uint32_t> frame_size;    // offset 0x008
+  std::atomic<uint8_t>  ready;         // offset 0x00C
+  uint8_t padding[3];                  // offset 0x00D-0x00F
 };
 
-static_assert(sizeof(SharedFrameLayout) == SHM_TOTAL_SIZE,
-              "SharedFrameLayout size mismatch with Godot layout");
-static_assert(offsetof(SharedFrameLayout, data) == SHM_FRAME_HEADER_SIZE,
-              "data offset must be 16 bytes");
+static_assert(sizeof(SharedFrameHeader) == SHM_FRAME_HEADER_SIZE,
+              "SharedFrameHeader size must be 16 bytes (matches Godot layout)");
+static_assert(offsetof(SharedFrameHeader, frame_size) == 8,
+              "frame_size must be at offset 8");
+static_assert(offsetof(SharedFrameHeader, ready) == 12,
+              "ready must be at offset 12");
+
+// 数据区的起始偏移（即 SHM_FRAME_HEADER_SIZE）。
+constexpr size_t SHM_DATA_OFFSET = SHM_FRAME_HEADER_SIZE;
 
 #endif // SHARED_FRAME_H

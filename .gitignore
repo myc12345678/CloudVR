@@ -7,12 +7,12 @@
 #   4. 第三方预编译二进制不入库（见 README 的恢复方式）
 # ============================================================================
 
-# ---- 机器相关的生成配置（提交 config.json.example 模板，勿提交 config.json）----
+# ---- 机器相关的配置（提交 config.json.example 模板，勿提交 config.json）----
 config.json
 
-# 由 scripts/gen_config.py 依据 config.json 自动生成，且含绝对路径/主机名
-Gstreamer/config.h
-html/config.js
+# 说明：配置由各子系统在运行时读取 config.json，不再需要编译期生成文件。
+# Gstreamer/config.h 现为手写的运行时配置头文件，需入库；由 config.cpp 在
+# 启动时解析 config.json。
 
 # ---- GStreamer 构建产物 ----
 Gstreamer/*.o

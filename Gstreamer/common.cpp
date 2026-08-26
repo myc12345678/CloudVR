@@ -23,7 +23,7 @@ std::atomic<bool> tcp_running{false};
 std::atomic<uint64_t> frame_counter{0};
 
 int shm_fd = -1;
-SharedFrameLayout *shm_frame = nullptr;
+SharedFrameHeader *shm_frame = nullptr;
 std::atomic<bool> shm_running{false};
 
 std::atomic<bool> shutting_down{false};

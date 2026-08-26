@@ -9,8 +9,8 @@
 #include <libsoup/soup.h>
 #include <string>
 
-// ======================== 编译时常量 ========================
-// 所有可配置常量已移至 config.json，由 scripts/gen_config.py 生成 config.h
+// ======================== 运行时配置 ========================
+// 所有可配置项在启动时从 config.json 读取（见 config.cpp / main.cpp）
 #include "config.h"
 
 #include "shared_frame.h"
@@ -37,7 +37,7 @@ extern std::atomic<uint64_t> frame_counter;
 
 // 共享内存帧传输
 extern int shm_fd;
-extern SharedFrameLayout *shm_frame;
+extern SharedFrameHeader *shm_frame;
 extern std::atomic<bool> shm_running;
 
 // 全局关停标志：由信号处理器置位，用于停止所有后台重连调度

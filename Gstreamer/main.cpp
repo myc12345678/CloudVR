@@ -2,8 +2,11 @@
 #include <gst/gst.h>
 #include <iostream>
 #include <libsoup/soup.h>
+#include <string>
+#include <vector>
 
 #include "common.h"
+#include "config.h"
 #include "pipeline.h"
 #include "signalling.h"
 #include "tcp_server.h"
@@ -21,6 +24,32 @@ int main(int argc, char *argv[]) {
 
   (void)std::signal(SIGINT, on_signal);
   (void)std::signal(SIGTERM, on_signal);
+
+  // ---- 运行期加载 config.json（不再编译期生成）----
+  // 支持 --config <path> 显式指定；否则依次尝试当前目录 / 上级目录的 config.json。
+  std::string explicit_config;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--config" && i + 1 < argc) {
+      explicit_config = argv[i + 1];
+      ++i;
+    }
+  }
+  std::vector<std::string> candidates;
+  if (!explicit_config.empty())
+    candidates.push_back(explicit_config);
+  candidates.push_back("config.json");    // 从仓库根目录运行
+  candidates.push_back("../config.json"); // 从 Gstreamer/ 目录运行
+
+  if (load_config_from_candidates(g_config, candidates)) {
+    std::cout << "config.json loaded (runtime) -> " << g_config.frame_width
+              << "x" << g_config.frame_height << "@" << g_config.frame_fps
+              << "fps, signalling=" << g_config.signalling_url << std::endl;
+  } else {
+    std::cout << "No valid config.json, using built-in defaults" << std::endl;
+  }
+  // 同步 signalling.cpp 中使用的全局 peer/self id
+  self_id = g_config.self_id;
+  peer_id = g_config.peer_id;
 
   start_pipeline();
   start_godot_tcp_server(); // TCP 输入控制指令（保留）

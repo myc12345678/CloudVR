@@ -20,14 +20,15 @@ void push_raw_frame_to_appsrc(const uint8_t *data, size_t size) {
 
   uint64_t frame_index = frame_counter.fetch_add(1);
   GST_BUFFER_PTS(buffer) =
-      gst_util_uint64_scale(frame_index, GST_SECOND, FRAME_FPS);
-  GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, FRAME_FPS);
+      gst_util_uint64_scale(frame_index, GST_SECOND, g_config.frame_fps);
+  GST_BUFFER_DURATION(buffer) =
+      gst_util_uint64_scale(1, GST_SECOND, g_config.frame_fps);
 
   GstFlowReturn ret =
       gst_app_src_push_buffer(GST_APP_SRC(current_appsrc), buffer);
   if (ret != GST_FLOW_OK) {
     std::cerr << "gst_app_src_push_buffer failed: " << ret << std::endl;
-  } else if ((frame_index % FRAME_FPS) == 0) {
+  } else if ((frame_index % g_config.frame_fps) == 0) {
     std::cout << "Pushed raw frame " << frame_index << ", size=" << size
               << std::endl;
   }
@@ -102,7 +103,7 @@ static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer /*data*/) {
 static constexpr char QUEUE_ARGS[] =
     "max-size-bytes=0 max-size-buffers=1 max-size-time=0 leaky=downstream";
 
-// 根据配置构建 Pipeline 字符串
+// 根据运行时配置（g_config，来自 config.json）构建 Pipeline 字符串
 //   - NVENC 硬件路径: appsrc → queue → videoconvert → queue
 //     → cudaupload → nvh264enc → rtph264pay → webrtcbin (零拷贝上传到 GPU)
 //   - 软件 VP8 路径: appsrc → queue → videoconvert → queue
@@ -113,26 +114,28 @@ static std::string build_pipeline_desc() {
        << "stun-server=stun://stun.l.google.com:19302 "
        << "appsrc name=godotsrc is-live=true format=time do-timestamp=true "
        << "caps=video/x-raw,format=RGB,"
-       << "width=" << FRAME_WIDTH << ","
-       << "height=" << FRAME_HEIGHT << ","
-       << "framerate=" << FRAME_FPS << "/1 ! "
+       << "width=" << g_config.frame_width << ","
+       << "height=" << g_config.frame_height << ","
+       << "framerate=" << g_config.frame_fps << "/1 ! "
        << "queue " << QUEUE_ARGS << " ! "
        << "videoconvert ! "
        << "queue " << QUEUE_ARGS << " ! ";
 
-  if constexpr (ENC_IS_HARDWARE) {
+  if (g_config.enc_is_hardware) {
     // NVENC 硬件编码路径
     // cudaupload → 零拷贝上传 CPU 帧到 GPU 显存
     // cudaconvert → GPU 端格式转换（RGB → NV12），nvh264enc 强制要求 NV12
     // 注意：cudaconvert 必须在 cudaupload 之后、编码器之前，否则编码器收不到
     // NV12 输入
-    desc << "cudaupload ! cudaconvert ! " << ENC_PIPELINE_ELEM << " "
-         << ENC_OPTIONS << " ! h264parse ! " << ENC_RTP_PAYLOADER << " ! "
-         << ENC_RTP_CAPS << " ! ";
+    desc << "cudaupload ! cudaconvert ! " << g_config.enc_pipeline_elem << " "
+         << g_config.enc_options << " ! h264parse ! "
+         << g_config.enc_rtp_payloader << " ! " << g_config.enc_rtp_caps
+         << " ! ";
   } else {
     // 软件 VP8
-    desc << ENC_PIPELINE_ELEM << " " << ENC_OPTIONS << " ! "
-         << ENC_RTP_PAYLOADER << " ! " << ENC_RTP_CAPS << " ! ";
+    desc << g_config.enc_pipeline_elem << " " << g_config.enc_options << " ! "
+         << g_config.enc_rtp_payloader << " ! " << g_config.enc_rtp_caps
+         << " ! ";
   }
 
   desc << "queue ! webrtc.";

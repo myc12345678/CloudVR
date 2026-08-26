@@ -188,7 +188,7 @@ static std::thread shm_thread;
 // 只在限频检查时调用，绝不会进入每帧热路径。
 static bool shm_path_replaced() {
   struct stat path_st{};
-  if (stat(SHM_FRAME_PATH, &path_st) != 0) {
+  if (stat(g_config.shm_path.c_str(), &path_st) != 0) {
     return true; // 文件已被删除 → 需要重新打开
   }
   struct stat fd_st{};
@@ -215,9 +215,9 @@ static void shm_reader_loop() {
       // Godot 使用 FileAccess 写入普通文件到 /dev/shm，
       // 因此这里用 open() 而非 shm_open() 打开同一文件。
       // /dev/shm 是 tmpfs，文件内容即驻留在 RAM 中，mmap 实现零拷贝。
-      shm_fd = open(SHM_FRAME_PATH, O_RDONLY);
+      shm_fd = open(g_config.shm_path.c_str(), O_RDONLY);
       if (shm_fd < 0) {
-        std::cerr << "open(" << SHM_FRAME_PATH
+        std::cerr << "open(" << g_config.shm_path
                   << ") failed: " << std::strerror(errno)
                   << " -- waiting for Godot to create it, retrying in 1s"
                   << std::endl;
@@ -225,13 +225,14 @@ static void shm_reader_loop() {
         continue;
       }
 
-      // 检测文件大小是否与编译期 SHM_TOTAL_SIZE 匹配。
+      // 检测文件大小是否与运行期（由 config.json 的宽高推导）的 SHM 总大小匹配。
       // 分辨率变更后 Godot 会重建文件；尺寸不符则等 Godot 重建后重试，而非报错退出。
       struct stat st{};
       if (fstat(shm_fd, &st) == 0 &&
-          static_cast<size_t>(st.st_size) != SHM_TOTAL_SIZE) {
+          static_cast<off_t>(st.st_size) !=
+              static_cast<off_t>(g_config.shm_total_size)) {
         std::cerr << "SHM file size mismatch: file=" << st.st_size
-                  << " expected=" << SHM_TOTAL_SIZE
+                  << " expected=" << g_config.shm_total_size
                   << " -- waiting for Godot to recreate it, retrying in 1s"
                   << std::endl;
         close(shm_fd);
@@ -240,8 +241,9 @@ static void shm_reader_loop() {
         continue;
       }
 
-      shm_frame = static_cast<SharedFrameLayout *>(
-          mmap(nullptr, SHM_TOTAL_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0));
+      shm_frame = static_cast<SharedFrameHeader *>(
+          mmap(nullptr, g_config.shm_total_size, PROT_READ, MAP_SHARED, shm_fd,
+               0));
       if (shm_frame == MAP_FAILED) {
         std::cerr << "mmap failed: " << std::strerror(errno) << std::endl;
         close(shm_fd);
@@ -253,9 +255,9 @@ static void shm_reader_loop() {
 
       last_counter = 0;
       last_inode_check = now_ms();
-      std::cout << "Reading frames from shared memory " << SHM_FRAME_PATH
-                << " (zero-copy, " << SHM_FRAME_MAX_SIZE << " bytes/frame)"
-                << std::endl;
+      std::cout << "Reading frames from shared memory " << g_config.shm_path
+                << " (zero-copy, " << g_config.shm_frame_max_size
+                << " bytes/frame)" << std::endl;
     }
 
     // ---- 每帧热路径（与原有逻辑一致，无新增 syscall） ----
@@ -270,7 +272,7 @@ static void shm_reader_loop() {
           std::cerr << "SHM file was re-created by Godot, re-opening"
                     << std::endl;
           if (shm_frame && shm_frame != MAP_FAILED) {
-            munmap(shm_frame, SHM_TOTAL_SIZE);
+            munmap(shm_frame, g_config.shm_total_size);
           }
           shm_frame = nullptr;
           continue; // 下一轮循环重新打开
@@ -294,8 +296,11 @@ static void shm_reader_loop() {
     }
 
     uint32_t frame_sz = shm_frame->frame_size.load(std::memory_order_acquire);
-    if (frame_sz > 0 && frame_sz <= SHM_FRAME_MAX_SIZE) {
-      push_raw_frame_to_appsrc(shm_frame->data, frame_sz);
+    if (frame_sz > 0 && frame_sz <= g_config.shm_frame_max_size) {
+      // 数据紧随 16 字节头部之后
+      const uint8_t *frame_data =
+          reinterpret_cast<const uint8_t *>(shm_frame) + SHM_FRAME_HEADER_SIZE;
+      push_raw_frame_to_appsrc(frame_data, frame_sz);
     }
   }
 
@@ -320,7 +325,7 @@ void stop_shm_frame_reader() {
     shm_thread.join();
 
   if (shm_frame && shm_frame != MAP_FAILED) {
-    munmap(shm_frame, SHM_TOTAL_SIZE);
+    munmap(shm_frame, g_config.shm_total_size);
     shm_frame = nullptr;
   }
 
@@ -352,7 +357,7 @@ void start_godot_tcp_server() {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(GODOT_TCP_PORT);
+  addr.sin_port = htons(g_config.godot_tcp_port);
 
   if (bind(tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
       0) {
@@ -371,8 +376,8 @@ void start_godot_tcp_server() {
 
   tcp_running = true;
   tcp_thread = std::thread(tcp_server_loop);
-  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:" << GODOT_TCP_PORT
-            << std::endl;
+  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:"
+            << g_config.godot_tcp_port << std::endl;
 }
 
 void stop_godot_tcp_server() {

@@ -415,9 +415,9 @@ static void start_signalling_connect() {
   if (!soup_session) {
     GError *tls_error = nullptr;
     GTlsDatabase *tls_db =
-        g_tls_file_database_new(SIGNALLING_CA_PATH, &tls_error);
+        g_tls_file_database_new(g_config.signalling_ca_path.c_str(), &tls_error);
     if (!tls_db) {
-      std::cerr << "Failed to load TLS CA file: " << SIGNALLING_CA_PATH
+      std::cerr << "Failed to load TLS CA file: " << g_config.signalling_ca_path
                 << " error=" << (tls_error ? tls_error->message : "unknown")
                 << std::endl;
       if (tls_error)
@@ -430,7 +430,7 @@ static void start_signalling_connect() {
     g_object_unref(tls_db);
   }
 
-  SoupMessage *msg = soup_message_new("GET", SIGNALLING_URL);
+  SoupMessage *msg = soup_message_new("GET", g_config.signalling_url.c_str());
   g_signal_connect(msg, "accept-certificate", G_CALLBACK(on_accept_certificate),
                    nullptr);
   soup_session_websocket_connect_async(soup_session, msg, nullptr, nullptr,

@@ -10,7 +10,7 @@
 | `Gstreamer/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送 |
 | `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 |
 | `html/` | 浏览器前端（WebRTC 接收端）+ nginx 配置 |
-| `scripts/` | `gen_config.py`：由 `config.json` 生成配置头/脚本 |
+| `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot；配置现由各子系统在运行时读取 `config.json` |
 
 ## 依赖与工具链
 
@@ -32,7 +32,8 @@
 ```bash
 # 1) 生成机器相关配置（把 config.json.example 的占位路径改成你的实际路径）
 cp config.json.example config.json          # config.json 已 gitignore，不入库
-python3 scripts/gen_config.py               # 生成 Gstreamer/config.h 和 html/config.js
+# 配置在运行时读取：GStreamer sender / 浏览器 / Godot / node 均直接读取 config.json，
+# 无需再运行 gen_config.py 生成配置头/脚本。
 
 # 2) 拉取 WebRTC GDExtension 预编译库（仅克隆到新机器时需要）
 git lfs install
@@ -205,8 +206,18 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 ## 配置（机器相关，不入库）
 
 `config.json` 含本机绝对路径与主机名，**已 gitignore**。克隆/换机器后按上文「一次性的初始化」第 1 步
-复制 `config.json.example` 为 `config.json`，并运行 `python3 scripts/gen_config.py`
-重新生成 `Gstreamer/config.h` 与 `html/config.js` 即可。
+复制 `config.json.example` 为 `config.json` 即可。
+
+所有子系统均在**运行时**读取该文件，无需重新编译：
+
+- `Gstreamer/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `Gstreamer/config.cpp`）。
+  可用 `--config <path>` 显式指定；默认依次查找当前目录及上级目录的 `config.json`。
+- `html/script.js`：页面启动时 `fetch('/config.json')` 读取（nginx 在 `/config.json` 暴露它，
+  见 `html/nginx.conf`）。
+- `signalling-server/server.js`：启动时读取 `config.json`。
+- `Godot/test/main.gd`：启动时读取 `config.json`。
+
+因此修改 `config.json` 后只需重启对应进程（浏览器需刷新页面），**无需重新编译**。
 
 > 注意：`config.json` 中的 `nginx.server_name` 与 `html/nginx.conf` 中的 `server_name`
 > 已统一改为 `127.0.0.1`（原域名为 `ar.myc.wiki`，已过期）。浏览器即通过该 IP 访问。
