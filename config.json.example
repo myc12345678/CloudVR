@@ -1,4 +1,11 @@
 {
+  "topology": {
+    "gpu_count": 1,
+    "players_per_gpu": 1
+  },
+  "concurrency": {
+    "max_users": 1
+  },
   "video": {
     "width": 1920,
     "height": 1080,
@@ -6,11 +13,17 @@
   },
   "godot": {
     "gstreamer_host": "127.0.0.1",
-    "tcp_port": 9002
+    "tcp_port": 9002,
+    "tcp_port_base": 9002,
+    "project_path": "/ABSOLUTE/PATH/TO/Godot/test"
   },
   "gstreamer": {
     "self_id": "cpp_sender",
     "peer_id": "browser",
+    "id_template": {
+      "sender": "sender_{index}",
+      "viewer": "viewer_{index}"
+    },
     "signalling_url": "wss://127.0.0.1:8443",
     "signalling_ca_path": "/ABSOLUTE/PATH/TO/signalling-server/certs/dev-cert.pem"
   },
@@ -38,6 +51,7 @@
     "rate_control": "cbr"
   },
   "shm": {
-    "path": "/dev/shm/godot_webrtc_frame"
+    "path": "/dev/shm/godot_webrtc_frame",
+    "path_template": "/dev/shm/godot_webrtc_frame_{index}"
   }
 }

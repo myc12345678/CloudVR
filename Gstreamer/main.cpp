@@ -47,6 +47,34 @@ int main(int argc, char *argv[]) {
   } else {
     std::cout << "No valid config.json, using built-in defaults" << std::endl;
   }
+
+  // ---- P1：并发/拓扑强校验（失败即拒绝启动，防资源不足/配置漂移）----
+  if (g_config.max_users < 1 || g_config.max_users > MAX_USERS_HARD) {
+    std::cerr << "FATAL: concurrency.max_users=" << g_config.max_users
+              << " 超出范围 [1, " << MAX_USERS_HARD << "]，拒绝启动"
+              << std::endl;
+    g_main_loop_unref(loop);
+    return 1;
+  }
+  if (g_config.max_users != g_config.gpu_count * g_config.players_per_gpu) {
+    std::cerr << "FATAL: concurrency.max_users=" << g_config.max_users
+              << " ≠ topology.gpu_count(" << g_config.gpu_count
+              << ") × topology.players_per_gpu(" << g_config.players_per_gpu
+              << ")=" << (g_config.gpu_count * g_config.players_per_gpu)
+              << "，拒绝启动" << std::endl;
+    g_main_loop_unref(loop);
+    return 1;
+  }
+  std::cout << "topology: gpu_count=" << g_config.gpu_count
+            << " players_per_gpu=" << g_config.players_per_gpu
+            << " max_users=" << g_config.max_users << std::endl;
+  // P1 校验模板展开（u=0）；后续阶段由 UserSession 按 u 消费，旧键退场。
+  std::cout << "derived[u=0]: shm="
+            << expand_index_template(g_config.shm_path_template, 0)
+            << " sender=" << expand_index_template(g_config.sender_id_template, 0)
+            << " viewer=" << expand_index_template(g_config.viewer_id_template, 0)
+            << std::endl;
+
   // 同步 signalling.cpp 中使用的全局 peer/self id
   self_id = g_config.self_id;
   peer_id = g_config.peer_id;

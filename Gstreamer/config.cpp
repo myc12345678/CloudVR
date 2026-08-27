@@ -54,6 +54,18 @@ std::string get_string(JsonObject *obj, const char *key,
 
 } // namespace
 
+std::string expand_index_template(const std::string &tmpl, int index) {
+  const std::string placeholder = "{index}";
+  const std::string value = std::to_string(index);
+  std::string out = tmpl;
+  std::string::size_type pos = 0;
+  while ((pos = out.find(placeholder, pos)) != std::string::npos) {
+    out.replace(pos, placeholder.size(), value);
+    pos += value.size();
+  }
+  return out;
+}
+
 bool load_config(Config &cfg, const std::string &config_path) {
   GError *error = nullptr;
   gchar *data = nullptr;
@@ -90,6 +102,15 @@ bool load_config(Config &cfg, const std::string &config_path) {
   }
   JsonObject *obj = json_node_get_object(root);
 
+  // ---- topology / concurrency（多用户/多 GPU，P1 新增）----
+  if (JsonObject *t = get_object(obj, "topology")) {
+    cfg.gpu_count = get_int(t, "gpu_count", cfg.gpu_count);
+    cfg.players_per_gpu = get_int(t, "players_per_gpu", cfg.players_per_gpu);
+  }
+  if (JsonObject *c = get_object(obj, "concurrency")) {
+    cfg.max_users = get_int(c, "max_users", cfg.max_users);
+  }
+
   // ---- video ----
   if (JsonObject *v = get_object(obj, "video")) {
     cfg.frame_width = static_cast<unsigned int>(get_int(v, "width", 1920));
@@ -97,9 +118,12 @@ bool load_config(Config &cfg, const std::string &config_path) {
     cfg.frame_fps = static_cast<unsigned int>(get_int(v, "fps", 60));
   }
 
-  // ---- godot TCP ----
+  // ---- godot ----
   if (JsonObject *g = get_object(obj, "godot")) {
     cfg.godot_tcp_port = get_int(g, "tcp_port", cfg.godot_tcp_port);
+    cfg.tcp_port_base = get_int(g, "tcp_port_base", cfg.tcp_port_base);
+    cfg.godot_project_path =
+        get_string(g, "project_path", cfg.godot_project_path);
   }
 
   // ---- gstreamer (signalling) ----
@@ -109,6 +133,12 @@ bool load_config(Config &cfg, const std::string &config_path) {
     cfg.signalling_url = get_string(gs, "signalling_url", cfg.signalling_url);
     cfg.signalling_ca_path =
         get_string(gs, "signalling_ca_path", cfg.signalling_ca_path);
+    if (JsonObject *idt = get_object(gs, "id_template")) {
+      cfg.sender_id_template =
+          get_string(idt, "sender", cfg.sender_id_template);
+      cfg.viewer_id_template =
+          get_string(idt, "viewer", cfg.viewer_id_template);
+    }
   }
 
   // ---- encoding ----
@@ -144,6 +174,8 @@ bool load_config(Config &cfg, const std::string &config_path) {
   // ---- shared memory ----
   if (JsonObject *s = get_object(obj, "shm")) {
     cfg.shm_path = get_string(s, "path", cfg.shm_path);
+    cfg.shm_path_template =
+        get_string(s, "path_template", cfg.shm_path_template);
   }
 
   // ---- 派生的运行期尺寸 ----
