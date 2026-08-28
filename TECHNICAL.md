@@ -1,16 +1,22 @@
 # Godot → WebRTC 低延迟流式传输系统 — 技术文档
 
+> **多用户 / 多 GPU 改造（进行中）**：系统已从"单用户点对点"演进为**多用户架构**——
+> 每个用户一个 Godot 玩家实例（独立 SubViewport）、一路独立视频流、一份独立输入状态；
+> 用户槽位由信令服务器自动分配，浏览器访问一个 URL 即可。多 GPU 上"每 GPU 一个 Godot
+> 实例 + 每管线绑卡编码"尚在实施中。详见 [docs/multi-user-multi-gpu-design.md](docs/multi-user-multi-gpu-design.md)。
+> 本文档下方各节保留单用户基础架构的技术细节，多用户相关的差异已在对应位置标注。
+
 ## 1. 项目概述
 
-本项目实现了一套完整的**低延迟云游戏流式传输系统**：Godot 游戏引擎将渲染画面实时编码并通过 WebRTC 传输到浏览器，同时接收浏览器的键盘/鼠标输入反向控制游戏角色。整个系统由四个核心进程组成。
+本项目实现了一套完整的**低延迟云游戏流式传输系统**：Godot 游戏引擎将渲染画面实时编码并通过 WebRTC 传输到浏览器，同时接收浏览器的键盘/鼠标输入反向控制游戏角色。整个系统由四个核心进程组成。当前已支持**多用户并发**：每个用户一个玩家实例，由信令服务器自动分配槽位。
 
 ### 1.1 核心组件
 
 | 组件 | 语言 | 角色 |
 |------|------|------|
-| **Godot 游戏引擎** | GDScript | 渲染 3D 场景，捕获帧数据，接收输入指令 |
-| **GStreamer 发送端** | C++17 | 从共享内存读取 RGB 帧，硬件/软件编码后通过 WebRTC 发送 |
-| **Signalling Server** | Node.js (零依赖) | WebSocket 信令中继 + 输入消息转发 |
+| **Godot 游戏引擎** | GDScript | 渲染 3D 场景（每玩家一个 SubViewport），捕获帧数据，接收输入指令 |
+| **GStreamer 发送端** | C++17 | 从共享内存读取 RGB 帧，硬件/软件编码后通过 WebRTC 发送；`godot_process.*` 负责启动/重启 Godot 子进程 |
+| **Signalling Server** | Node.js (零依赖) | WebSocket 信令中继 + 输入消息转发 + 用户槽位自动分配 |
 | **Browser 前端** | HTML/JS | WebRTC 接收端，解码播放视频并回传用户输入 |
 | **Nginx** | 配置 | 反向代理，提供 HTTPS/WSS 前端服务 |
 
@@ -130,11 +136,13 @@
     → JSON {"input":{"type":"keydown","key":"w",...}}
     → WebSocket send()
     → Signalling Server (原样转发，不解析)
-    → GStreamer on_ws_message() → handle_input_message()
-    → TCP send_to_godot() (4字节大端长度头 + JSON payload)
+    → GStreamer on_ws_message() → handle_input_message(u)
+    → 由 u 映射 (gpu, local_player)，注入 {"player": local_player, ...}
+    → TCP send_to_godot(gpu, player) (4字节大端长度头 + JSON payload)
     → Godot read_input_commands()
-    → NetworkInputRouter.handle_remote_input() → Input.action_press()
-    → 消费脚本 (Player.gd) 用标准 `Input` API 读取并驱动移动
+    → NetworkInputRouter.dispatch(player, type, payload)
+    → 写入对应玩家的 PlayerInput（多用户隔离，不再用全局 Input 单例）
+    → Player.gd 读自己的 player_input 驱动移动
 ```
 
 ---
@@ -159,16 +167,24 @@ config.json
 
 | 配置路径 | 说明 | 示例值 |
 |---------|------|--------|
+| `topology.gpu_count` | GPU 数量（多 GPU 编排） | 1 |
+| `topology.players_per_gpu` | 每 GPU 的玩家数 | 3 |
+| `concurrency.max_users` | 并发用户上限（= gpu_count × players_per_gpu） | 3 |
 | `video.width` / `height` / `fps` | 视频分辨率和帧率 | 1920 / 1080 / 60 |
-| `godot.tcp_port` | Godot ↔ GStreamer TCP 控制端口 | 9002 |
-| `gstreamer.self_id` / `peer_id` | WebRTC 会话 ID | cpp_sender / browser |
+| `godot.tcp_port_base` | Godot ↔ GStreamer TCP 控制端口基准（每 GPU 偏移 +gpu） | 9002 |
+| `godot.project_path` | Godot 项目目录（C++ 启动子进程用） | /path/to/Godot/test |
+| `godot.binary` / `launch` / `set_prime_env` | Godot 可执行文件 / 是否由 C++ 自动启动 / 是否注入 PRIME 环境变量 | godot / true / true |
+| `gstreamer.id_template.sender` / `.viewer` | 每用户信令 id 模板（`{index}` 展开为 u） | sender_{index} / viewer_{index} |
 | `gstreamer.signalling_url` | 信令服务器 WSS 地址 | wss://127.0.0.1:8443 |
 | `encoding.type` | 编码器类型 | nvenc / vp8_sw |
 | `encoding.encoder` | GStreamer 编码器元素名 | nvautogpuh264enc |
 | `encoding.bitrate_kbps` | 编码码率 (kbps) | 15000 |
 | `encoding.preset` | 编码预设 | low-latency |
 | `encoding.rate_control` | 码率控制模式 | cbr |
-| `shm.path` | 共享内存文件路径 | /dev/shm/godot_webrtc_frame |
+| `shm.path_template` | 共享内存路径模板（`{index}` 展开为全局用户索引） | /dev/shm/godot_webrtc_frame_{index} |
+
+> 旧键 `godot.tcp_port`、`gstreamer.self_id/peer_id`、`shm.path` 暂保留用于向后兼容，
+> 代码已切换到新键读取，旧键彻底移除待后续清理。
 
 ### 3.2 GStreamer 发送端 (C++)
 
@@ -178,12 +194,15 @@ config.json
 main()
   ├── gst_init()                    初始化 GStreamer
   ├── g_main_loop_new()             创建 GLib 主循环
-  ├── start_pipeline()              构建并启动 GStreamer pipeline
-  ├── start_godot_tcp_server()      启动 TCP 服务器 (接收控制指令)
-  ├── start_shm_frame_reader()      启动共享内存帧读取 (零拷贝视频)
-  ├── connect_to_signalling_server() 连接信令服务器 (WSS)
+  ├── load_config + 校验 max_users  读取并强校验并发/拓扑配置
+  ├── 初始化 g_sessions[]           按 u 展开 id 模板 + shm 路径
+  ├── start_godot_processes()       启动 Godot 子进程（若 godot.launch=true）
+  ├── 循环 u: start_pipeline(u)     每用户一条 GStreamer pipeline
+  ├── 循环 u: start_shm_frame_reader(u)  每用户一个 shm 读取线程
+  ├── 循环 u: connect_to_signalling_server(u)  每用户一个 WSS 信令连接
+  ├── 循环 g: start_godot_tcp_server(g)  每 GPU 一条 TCP 控制通道
   ├── g_main_loop_run()             进入事件循环
-  └── 清理资源
+  └── 清理资源（先关 Godot，再逐用户清管线）
 ```
 
 #### 3.2.2 Pipeline 构建 (`pipeline.cpp`)
@@ -351,7 +370,8 @@ handleTextFromClient(msg):
   │   ├── {"sdp":{...}}  → 转发给 peer
   │   └── {"ice":{...}}  → 转发给 peer
   └── 其他                                            → handleTextMessage()
-      ├── HELLO <id>     → 注册客户端 → HELLO_OK
+      ├── ASSIGN          → 自动分配空闲 viewer 槽位 → ASSIGNED <k> / ASSIGN_FAILED
+      ├── HELLO <id>     → 注册客户端（校验 u < max_users）→ HELLO_OK
       ├── SESSION <id>   → 绑定 peer → SESSION_OK
       ├── PING           → PONG
       └── 未知            → 日志记录
@@ -362,6 +382,9 @@ handleTextFromClient(msg):
 - 输入消息 `{"input":...}` 不走 `JSON.parse` + `JSON.stringify`，直接 `sendTextFrame(peerState, msg)` 原样转发，避免高频解析开销
 - HTTPS + 自签名证书，WebSocket 升级基于 HTTP Upgrade 机制
 - 客户端映射表 `clients: Map<id, ClientState>` 支持任意两端配对
+- **用户槽位自动分配**：浏览器发 `ASSIGN`，服务器遍历 `0..max_users-1` 找第一个未被
+  `viewer_<k>` 占用的槽位，返回 `ASSIGNED <k>`；全满返回 `ASSIGN_FAILED` 并断开。
+  浏览器断开后槽位经 `clients.delete` 自动释放，供下一个用户复用。
 
 ### 3.4 浏览器前端 (`html/script.js`)
 
@@ -370,10 +393,11 @@ handleTextFromClient(msg):
 ```
 connectWebSocket()
   ├── new WebSocket(wsUrl)
-  ├── onopen  → HELLO <selfId> → start heartbeat (30s PING/PONG)
+  ├── onopen  → ASSIGN (自动分配槽位) → start heartbeat (30s PING/PONG)
   ├── onclose → reset WebRTC → scheduleReconnect (指数退避)
   └── onmessage:
-      ├── HELLO_OK       → SESSION <peerId>
+      ├── ASSIGNED <k>   → 设 selfId=viewer_<k> / peerId=sender_<k> → SESSION <peerId>
+      ├── ASSIGN_FAILED  → 显示"无法接入会话"错误页，停止重连
       ├── SESSION_OK     → send {"reset":true} (触发 renegotiation)
       └── JSON {sdp/ice} → handleSignallingMessage()
 ```
@@ -421,24 +445,26 @@ connectWebSocket()
 ```
 _ready():
   ├── _load_config()              ← 从 config.json 读取参数
+  ├── _load_launch_args()         ← 读 --dsh-gpu/--dsh-players（C++ 启动时传入）
   ├── get_window().set_size()     ← 窗口设为目标渲染分辨率 (避免 CPU resize)
   ├── OS.low_processor_usage_mode = false  ← 失焦/最小化时仍持续渲染
   ├── DisplayServer.VSYNC_DISABLED         ← 关闭垂直同步以跑满目标帧率
-  ├── _setup_sub_viewport()       ← 建立离屏 SubViewport 渲染世界
+  ├── _setup_players()            ← 每玩家一个 SubViewport(共享世界) + Player 实例
   ├── _attempt_connect()          ← 连接 GStreamer TCP 控制通道
-  └── _open_shm()                 ← 打开 /dev/shm 共享内存文件
+  └── _open_shm()                 ← 每玩家打开独立 /dev/shm 共享内存文件
 
 _process(delta):
   ├── _update_connection_state()  ← 驱动非阻塞 TCP 连接
   ├── 若未连接 → 每 2 秒重试 _attempt_connect()
-  ├── read_input_commands()       ← 读取 TCP 控制指令 (状态机解析)
+  ├── read_input_commands()       ← 读取 TCP 控制指令 (状态机解析，带 player 字段)
   ├── frame_accumulator += delta
   └── if accumulator >= frame_interval → send_frame()
 
 send_frame():
-  ├── _sub_viewport.get_texture().get_image()   ← 离屏纹理回读 (RGB8)
+  ├── 循环每个玩家 k:
+  ├── _sub_viewports[k].get_texture().get_image()   ← 离屏纹理回读 (RGB8)
   ├── 必要时 resize 到目标分辨率
-  ├── _send_frame_via_shm(data)
+  ├── _send_frame_via_shm(k, data)
   │   ├── ready = 0
   │   ├── seek(16) store_buffer(data)   ← 写入 RGB8 像素数据
   │   ├── 构建 16 字节头: counter + size + ready=1
@@ -451,18 +477,21 @@ send_frame():
 
 ```
 _physics_process(delta):
-  ├── turn = Input.get_axis("turn_right", "turn_left")
+  ├── if player_input == null → return
+  ├── turn = (player_input.turn_left ? 1 : 0) - (player_input.turn_right ? 1 : 0)
   ├── rotate_y(turn * Rotate_Speed * delta)     ← a 左转 / d 右转
   ├── if not is_on_floor() → velocity += gravity
-  ├── move = Input.get_axis("move_back", "move_forward")
+  ├── move = (player_input.move_forward ? 1 : 0) - (player_input.move_back ? 1 : 0)
   ├── velocity.x = forward_dir.x * move * Speed  ← w 前进 / s 后退
   ├── velocity.z = forward_dir.z * move * Speed
   └── move_and_slide()
 ```
 
-**控制流**：`main.gd` 把 TCP 收到的输入指令交给 `NetworkInputRouter.handle_remote_input()`，由其用
-`Input.action_press()/action_release()` 注入标准 `Input` 单例；`Player.gd` 直接用 `Input.get_axis()` 等标准 API
-读取动作，完全不感知网络来源（键盘输入已被封装进 Godot 的输入体系）。
+**控制流（多用户隔离）**：`main.gd` 把 TCP 收到的输入指令交给
+`NetworkInputRouter.dispatch(player, type, payload)`，由其写入对应玩家的 `PlayerInput` 状态；
+`Player.gd` 读**自己的** `player_input`，不再读全局 `Input` 单例——这样多个玩家的输入彻底隔离，
+互不抢占。`PlayerInput`（`class_name PlayerInput`）每玩家一份，存四个动作 bool + 鼠标增量；
+`NetworkInputRouter.register(k)` 在玩家实例化时注册输入状态。
 
 ---
 
@@ -486,11 +515,13 @@ make                                # 编译 webrtc_sender（配置在运行时�
 
 ### 4.3 启动顺序
 
-> **已与先后解耦**：`webrtc_sender` 的 `start_shm_frame_reader()` 现在在一个常驻读帧线程里
-> 执行，`/dev/shm/godot_webrtc_frame` 不存在时会**每 1 秒重试打开**；Godot 运行中途
-> 重建该文件（分辨率变更 / 重启）也会被 sender 通过限频 inode 检测自动跟随。因此
-> **不再强制“先 Godot 再 sender”**。信令 WebSocket 在服务器未起/断开时也**不会退出**，
-> 而是带退避重连。下方步骤仅为“典型顺序”，任意顺序均可启动、自动衔接。
+> **已与先后解耦**：`webrtc_sender` 的 `start_shm_frame_reader(u)` 在常驻读帧线程里执行，
+> `/dev/shm/godot_webrtc_frame_<u>` 不存在时会**每 1 秒重试打开**；Godot 运行中途
+> 重建该文件也会被 sender 通过限频 inode 检测自动跟随。因此**不再强制“先 Godot 再 sender”**。
+> 信令 WebSocket 在服务器未起/断开时也**不会退出**，而是带退避重连。
+> 下方步骤仅为“典型顺序”，任意顺序均可启动、自动衔接。
+
+**方式 A（推荐）：C++ 自动编排 Godot**（`config.json` 设 `godot.launch = true`）
 
 ```bash
 # 1. 启动 Signalling Server
@@ -499,16 +530,30 @@ node signalling-server/server.js &
 # 2. (可选) 启动 Nginx
 #    nginx -c html/nginx.conf
 
-# 3. 启动 Godot 游戏项目（创建共享内存帧；即使后起，sender 也会重试等待）
-#    在 Godot 编辑器中打开 Godot/test/project.godot 并运行
-#    或命令行（推荐用脚本强制 NVIDIA 独显）：./scripts/run_godot.sh
+# 3. 启动 GStreamer 发送端（自动 fork/exec 启动 Godot，注入 PRIME 环境变量）
+cd Gstreamer && ./webrtc_sender &
 
-# 4. 启动 GStreamer 发送端（shm 已存在则立即读帧；未存在则重试，无需重启）
+# 4. 浏览器访问（无需 URL 参数，自动分配用户槽位）
+#    https://127.0.0.1:8444/
+```
+
+**方式 B：手动启动 Godot**（`godot.launch = false`，默认）
+
+```bash
+# 1. 启动 Signalling Server
+node signalling-server/server.js &
+
+# 2. (可选) 启动 Nginx
+#    nginx -c html/nginx.conf
+
+# 3. 启动 Godot（推荐用脚本强制 NVIDIA 独显）
+./scripts/run_godot.sh
+
+# 4. 启动 GStreamer 发送端
 cd Gstreamer && ./webrtc_sender &
 
 # 5. 浏览器访问
-#    http://127.0.0.1:8080/  (301 重定向到 HTTPS)
-#    或 https://127.0.0.1:8444/ (通过 Nginx，推荐)
+#    https://127.0.0.1:8444/
 ```
 
 ### 4.4 配置调整
@@ -552,40 +597,74 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 - Pipeline 级别的队列/缓冲管理
 - 丰富的调试工具 (`GST_DEBUG`)
 
+### 5.5 为什么多用户输入要解耦全局 Input 单例？
+
+单用户时 `NetworkInputRouter` 把浏览器按键注入 Godot 全局 `Input` 单例，`Player.gd` 用
+`Input.get_axis()` 读取——简洁但**多人会互相抢占**（任意一个浏览器的按键驱动所有玩家）。
+
+多用户改为**每玩家一份 `PlayerInput` 状态**：`NetworkInputRouter.dispatch(player, ...)` 写入
+对应玩家的状态，`Player.gd` 只读自己的 `player_input`。代价是失去全局 `Input` 的便利性，
+但换来输入彻底隔离——这是多人正确性的硬要求。
+
+### 5.6 为什么用户槽位用服务器自动分配（ASSIGN）而非 URL 参数？
+
+最初设计用 `?user=k` URL 参数让用户自选索引，但存在两个问题：
+1. 用户需手动指定索引，易冲突、体验差；
+2. 前端无法感知"哪个槽位空闲"，全满时只能靠越界校验兜底。
+
+改为信令服务器 `ASSIGN` 协议：浏览器连接后请求分配，服务器遍历 `0..max_users-1` 找第一个
+空闲 `viewer_<k>` 槽位返回；全满返回 `ASSIGN_FAILED`。槽位随连接断开自动释放。用户只需
+访问一个 URL，分配逻辑集中在服务器，与 `concurrency.max_users` 强一致。
+
+### 5.7 为什么由 C++ sender 编排 Godot 子进程？
+
+多 GPU 时"每 GPU 一个 Godot 实例"，这些实例的生命周期（启动/崩溃重启/关停）若靠人工管理
+不可靠。由 C++ sender 统一 `fork/exec` 启动、`g_child_watch_add` 监听退出、指数退避重启、
+`SIGTERM` 优雅关停——Godot 与 sender 同生命周期，运维只需启动 sender 一个进程
+（`godot.launch=true` 时）。同时 C++ 启动时可注入 NVIDIA PRIME 环境变量（`set_prime_env`），
+等效于旧的手动 `run_godot.sh`。
+
 ---
 
 ## 6. 文件索引
 
 ```
 /home/myc/develop/test/
-├── config.json                          # 单一配置源（运行时读取）
+├── config.json                          # 单一配置源（运行时读取，已 gitignore）
+├── config.json.example                  # 配置模板（占位路径）
 ├── scripts/
-│   └── run_godot.sh                     # 强制用 NVIDIA 独显启动 Godot
+│   └── run_godot.sh                     # 手动启动 Godot（旧方式，现可由 C++ 自动启动替代）
+├── docs/
+│   ├── multi-user-multi-gpu-design.md   # 多用户 + 多 GPU 架构设计文档
+│   └── gpu-zero-copy-design.md          # GPU 零拷贝分析
 ├── Gstreamer/
-│   ├── main.cpp                         # 入口（启动时加载 config.json）
+│   ├── main.cpp                         # 入口（加载配置 + 校验 + 编排启动）
 │   ├── config.cpp / config.h            # 运行时配置解析（json-glib）+ Config 结构
-│   ├── pipeline.cpp / pipeline.h        # GStreamer Pipeline 构建
-│   ├── signalling.cpp / signalling.h    # WebRTC 信令 + WebSocket
-│   ├── tcp_server.cpp / tcp_server.h    # TCP 控制 + 共享内存读取
-│   ├── common.cpp / common.h            # 全局状态
+│   ├── session.h                        # UserSession / GpuTcpState 结构
+│   ├── godot_process.cpp / .h           # Godot 子进程启动/重启/关停
+│   ├── pipeline.cpp / pipeline.h        # GStreamer Pipeline 构建（每用户一条）
+│   ├── signalling.cpp / signalling.h    # WebRTC 信令 + WebSocket（按 u 隔离）
+│   ├── tcp_server.cpp / tcp_server.h    # TCP 控制（每 GPU 一条）+ 共享内存读取
+│   ├── common.cpp / common.h            # 全局状态 + g_sessions/g_gpu_tcp
 │   ├── shared_frame.h                   # 共享内存数据布局（头部固定 16 字节）
 │   └── Makefile                         # 编译脚本
 ├── signalling-server/
-│   ├── server.js                        # 纯 Node.js 信令服务器
+│   ├── server.js                        # 纯 Node.js 信令服务器 + 槽位自动分配
 │   └── certs/                           # TLS 证书
 ├── html/
-│   ├── test.html                        # 前端页面
-│   ├── script.js                        # WebRTC 客户端 + 输入捕获（运行时 fetch config.json）
+│   ├── test.html                        # 前端页面 + 分配失败错误页
+│   ├── script.js                        # WebRTC 客户端 + 输入捕获 + ASSIGN 自动分配
 │   ├── style.css                        # 样式
 │   └── nginx.conf                       # Nginx 配置（在 /config.json 暴露配置）
 └── Godot/
     └── test/
         ├── project.godot                # Godot 项目文件
-        ├── main.gd                      # 帧捕获 + 配置加载 + 输入指令入口
-        ├── NetworkInputRouter.gd        # 网络输入路由器（autoload）
-        ├── VirtualMouse.gd              # 虚拟鼠标（autoload）
-        ├── Player.gd                    # 角色控制器
-        ├── node_3d.tscn                 # 主场景
+        ├── main.gd                      # 帧捕获 + 配置加载 + 多 SubViewport 玩家编排
+        ├── NetworkInputRouter.gd        # 网络输入路由器（autoload，按玩家分发）
+        ├── PlayerInput.gd               # 每玩家输入状态（class_name PlayerInput）
+        ├── Player.gd                    # 角色控制器（读自己的 PlayerInput）
+        ├── player.tscn                  # 玩家场景（运行时实例化 N 份）
+        ├── node_3d.tscn                 # 主场景（世界内容）
         └── addons/webrtc/               # WebRTC GDExtension
 ```
 
@@ -829,13 +908,22 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 ```json
 // config.json — 单一配置源
 {
+  "topology": { "gpu_count": 1, "players_per_gpu": 3 },
+  "concurrency": { "max_users": 3 },
   "video": { "width": 1920, "height": 1080, "fps": 60 },
-  "godot": { "gstreamer_host": "127.0.0.1", "tcp_port": 9002 },
+  "godot": {
+    "gstreamer_host": "127.0.0.1", "tcp_port_base": 9002,
+    "project_path": "/home/myc/develop/test/Godot/test",
+    "binary": "godot", "launch": true, "set_prime_env": true
+  },
+  "gstreamer": {
+    "id_template": { "sender": "sender_{index}", "viewer": "viewer_{index}" }
+  },
   "encoding": {
     "type": "nvenc", "codec": "h264", "encoder": "nvautogpuh264enc",
     "bitrate_kbps": 15000, "preset": "low-latency", "rate_control": "cbr"
   },
-  "shm": { "path": "/dev/shm/godot_webrtc_frame" }
+  "shm": { "path_template": "/dev/shm/godot_webrtc_frame_{index}" }
 }
 ```
 
@@ -847,7 +935,7 @@ bool load_config(Config &cfg, const std::string &path);
 
 ```javascript
 // html/script.js — 页面启动时 fetch('/config.json')（nginx 暴露）
-await loadRuntimeConfig();             // 读取 gstreamer.self_id / peer_id
+await loadRuntimeConfig();             // 读取 concurrency.max_users 等
 ```
 
 修改 `config.json` 后只需重启对应进程（浏览器刷新页面），无需重新编译。

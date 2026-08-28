@@ -1,6 +1,6 @@
 # 多用户 + 多 GPU 架构设计文档
 
-> 状态：**设计稿（已核对现有代码 + Godot 多卡行为 + WSL2 GPU 栈 + NVENC 并发约束），尚未实施，未改任何代码。**
+> 状态：**已部分实施。单卡多用户（P1~P3）与 C++ 编排 Godot 子进程（P4 前置）已完成；多 GPU 编码绑定、多卡编排（P4 完整）、WSL2 双卡测试（P5）、原生 Linux 多卡验证（P6）尚未实施。** 各阶段实现状态见 §7。
 > 适用范围：`Gstreamer/` 发送端、`Godot/test/` 游戏端、`signalling-server/` 信令、`html/` 浏览器前端。
 > 目标：把当前"1 发送端 ↔ 1 浏览器"的单用户点对点系统，改造为"多个用户、每个用户一个 Godot 玩家实例、多 GPU 上并行渲染+编码"的系统。
 > 结论先行：**改造核心是把整条全链路单例（SubViewport/shm/sender/pipeline/ws_conn/输入）用一个用户索引 `u` 参数化；Godot 因单进程只能用一张卡而采用"每 GPU 一个 Godot 实例"，由 C++ sender 统一启动与编排；并发上限由唯一配置源 `config.json` 的 `topology` 强校验决定。**
@@ -61,8 +61,8 @@ Godot 实例 g（每 GPU 一个，共享同一项目文件，只读）
  ├─ 写 players_per_gpu 个 shm
  └─ 一条 TCP 连 sender，接收带 player_index 的输入 → 分发到对应 PlayerInput
 
-signalling server（Map<id,conn>，校验 total_users 上限）
-浏览器 u（?user=u）→ 收流 + 输入 → 只影响 Player_u
+signalling server（Map<id,conn>，校验 total_users 上限 + 自动分配 viewer 槽位）
+浏览器（自动分配 u）→ 收流 + 输入 → 只影响 Player_u
 ```
 
 ### 3.1 二维 → 一维映射（全局用户 id `u`）
@@ -124,7 +124,10 @@ signalling server（Map<id,conn>，校验 total_users 上限）
 
   "godot": {
     "project_path": "/home/myc/develop/test/Godot/test",
-    "tcp_port_base": 9002
+    "tcp_port_base": 9002,
+    "binary": "godot",
+    "launch": true,
+    "set_prime_env": true
   },
 
   "gstreamer": {
@@ -160,6 +163,11 @@ signalling server（Map<id,conn>，校验 total_users 上限）
 - 删除 `shm.path` 单值 → 换成 `shm.path_template` + `{index}`。
 - 删除 `godot.tcp_port` → 换成 `godot.tcp_port_base`（用户 k 用 `tcp_port_base + gpu(k)`）。
 - 新增 `topology`（gpu_count + players_per_gpu）、`concurrency.max_users`、`godot.project_path`。
+- 新增 `godot.binary`（Godot 可执行文件）、`godot.launch`（是否由 C++ 自动启动）、
+  `godot.set_prime_env`（是否注入 NVIDIA PRIME 环境变量）——P4 前置新增。
+
+> 注：`gstreamer.self_id/peer_id`、`shm.path`、`godot.tcp_port` 旧键目前仍保留在
+> config 中（向后兼容），C++/Godot 端已切换到新键读取；旧键彻底移除待后续清理。
 
 > **不兼容点**：`k=0` 的 shm 名也会变成 `..._frame_0`（不再是旧名），这是"统一由模板派生"的代价，README 需同步说明。
 
@@ -171,8 +179,8 @@ signalling server（Map<id,conn>，校验 total_users 上限）
 | C++ sender | 编译期硬顶 `MAX_USERS_HARD`（如 16） | 启动时校验 `0 < max_users ≤ MAX_USERS_HARD`，越界拒绝启动 |
 | C++ sender | 拓扑一致性 | 强校验 `max_users == gpu_count × players_per_gpu`，不相等拒绝启动 |
 | Godot | 只渲染本实例 `players_per_gpu` 个玩家 | 读同一 `config.json` |
-| 信令服务器 | `HELLO viewer_u/sender_u` 时校验 `u < max_users` | 超限 `socket.destroy()` |
-| 浏览器 | `?user=u` 校验 `u < max_users` | 越界提示"超出并发上限" |
+| 信令服务器 | `HELLO viewer_u/sender_u` 时校验 `u < max_users`；`ASSIGN` 时分配空闲槽位，全满回 `ASSIGN_FAILED` | 超限 `socket.destroy()` / 分配失败断开 |
+| 浏览器 | 连接后 `ASSIGN` 自动分配，无需用户指定 | 分配失败显示错误页 |
 
 ---
 
@@ -180,13 +188,16 @@ signalling server（Map<id,conn>，校验 total_users 上限）
 
 ### 6.1 C++ sender（核心重构，工作量最大）
 
-**`Gstreamer/config.h` / `config.cpp`**
+> 实现状态：P2/P3 已完成下述大部分改造；**尚未实现**每管线 CUDA 设备绑定
+> （`cuda-device-id = gpu(u)`，见 pipeline 小节）。
+
+**`Gstreamer/config.h` / `config.cpp`** ✅ 已实现（P1）
 - `Config` 增加：`int max_users`、`int gpu_count`、`int players_per_gpu`、`int tcp_port_base`、`std::string shm_path_template`、`std::string sender_id_template`、`std::string viewer_id_template`、`std::string godot_project_path`。
 - 删除 `self_id`/`peer_id`/`godot_tcp_port`/`shm_path` 单值。
 - `config.cpp` 解析 `topology`/`concurrency`/`godot`/`gstreamer.id_template`/`shm.path_template`。
 - 加载后对每个 `u` 展开模板（`{index}` → 数字）得到 `shm_path[u]`、`sender_id[u]`、`viewer_id[u]`、`tcp_port[u]`。
 
-**新增 `Gstreamer/session.h`（关键数据结构）**
+**新增 `Gstreamer/session.h`（关键数据结构）** ✅ 已实现（P2）
 
 ```cpp
 struct UserSession {
@@ -197,7 +208,7 @@ struct UserSession {
   GstElement *webrtcbin = nullptr;
   GstElement *appsrc = nullptr;
   guint bus_watch_id = 0;
-  uint64_t frame_counter = 0;
+  std::atomic<uint64_t> frame_counter{0};
 
   SoupWebsocketConnection *ws_conn = nullptr;
   bool ws_handshake_done = false;
@@ -208,92 +219,107 @@ struct UserSession {
   std::thread shm_thread;
   std::atomic<bool> shm_running{false};
 };
-extern std::vector<UserSession> g_sessions;   // 替代所有全局单例
+// 实际实现用 std::array<UserSession, MAX_USERS_HARD> g_sessions（含 thread/atomic
+// 不可拷贝，故用 array 就地构造，见 common.cpp）。
+extern std::array<UserSession, MAX_USERS_HARD> g_sessions;
 ```
 
-**`Gstreamer/common.h` / `common.cpp`**
+> 实际实现与设计差异：TCP 字段（`tcp_port/tcp_server_fd/tcp_client_fd/tcp_running/
+> tcp_thread/tcp_client_mutex`）**不在** `UserSession` 内，而是独立的 per-GPU
+> `GpuTcpState`（`std::array<GpuTcpState, MAX_USERS_HARD> g_gpu_tcp`），因为 TCP
+> 通道按 GPU 而非用户维度管理（见下）。
+
+**`Gstreamer/common.h` / `common.cpp`** ✅ 已实现（P2）
 - 删除单例全局（`pipeline/webrtcbin/appsrc/ws_conn/self_id/peer_id/session_started/bus_watch_id/shm_*/tcp_*`）。
-- 只保留 `loop`、`shutting_down`、`now_ms()`，其余全部迁入 `g_sessions[u]`。
+- 只保留 `loop`、`shutting_down`、`now_ms()`、`soup_session`，其余迁入 `g_sessions[u]` / `g_gpu_tcp[g]`。
 
-**`Gstreamer/pipeline.cpp`**
-- `build_pipeline_desc(u)`：给每个用户命名唯一 element 名（`webrtc0/godotsrc0`、`webrtc1/godotsrc1`…）。
-- 给 CUDA 元素（`cudaupload`/`cudaconvert`/`nvautogpuh264enc`）设 **`cuda-device-id = gpu(u)`**（或用独立 cuda-context），把第 u 路编码钉到第 gpu(u) 张卡。
-- `start_pipeline(u)/stop_pipeline(u)`、`maybe_reset_pipeline(u)`、`push_raw_frame_to_appsrc(u, ...)` 全部按 `u` 操作。
+**`Gstreamer/pipeline.cpp`** 🔶 已实现大部分（P2）
+- `build_pipeline_desc(u)`：给每个用户命名唯一 element 名（`webrtc0/godotsrc0`、`webrtc1/godotsrc1`…）。✅
+- 给 CUDA 元素设 **`cuda-device-id = gpu(u)`**：⬜ **尚未实现**（多 GPU 编码绑定，P4 待做）。
+- `start_pipeline(u)/stop_pipeline(u)`、`maybe_reset_pipeline(u)`、`push_raw_frame_to_appsrc(u, ...)` 全部按 `u` 操作。✅
 
-**`Gstreamer/signalling.cpp`**（回调上下文改造重头）
-- 所有信号回调（`on_negotiation_needed/on_offer_created/on_ice_candidate/on_set_description_promise_result/on_create_answer_promise_done/handle_sdp/handle_ice/send_sdp_to_peer/send_ice_to_peer`）一律把 `UserSession*`（或 `u`）作为 `user_data` 传入，替换全局 `webrtcbin/ws_conn` 引用。
-- `connect_webrtc_signals(GstElement*, int u)`。
-- 每用户独立 `SoupWebsocketConnection`（可共用 `SoupSession`，但 `ws_conn` 每用户一份）。
-- `send_text(u, ...)`、`HELLO sender_<u>`、`SESSION viewer_<u>`。
-- `reset` 消息只重置该用户管线：`stop_pipeline(u); start_pipeline(u)`。
-- 重连退避状态（`sign_reconnect_attempts/source`）按用户各自持有。
+**`Gstreamer/signalling.cpp`** ✅ 已实现（P2/P3）
+- 所有信号回调以 `u` 作为 `user_data`（`GINT_TO_POINTER(u)`）。✅
+- `connect_webrtc_signals(GstElement*, int u)`。✅
+- 每用户独立 `SoupWebsocketConnection`（共用 `SoupSession`）。✅
+- `send_text(u, ...)`、`HELLO sender_<u>`、`SESSION viewer_<u>`。✅
+- `reset` 消息只重置该用户管线。✅
+- 重连退避状态按用户各自持有。✅
 
-**`Gstreamer/tcp_server.cpp`**
-- 从"每玩家一条 TCP"改为**每 GPU 一条 TCP**（端口 `tcp_port_base + g`）。
-- 输入进来按 `u` 映射成 `(g, local_player)`，封装 `{"player": local_player, ...}` 发到对应 GPU 的 TCP 连接。
-- `send_to_godot(g, ...)` 各自独立 fd + mutex。
+**`Gstreamer/tcp_server.cpp`** ✅ 已实现（P3）
+- 每 GPU 一条 TCP（端口 `tcp_port_base + g`），`GpuTcpState` 数组。✅
+- 输入按 `u` 映射 `(g, local_player)`，封装 `{"player": local_player, ...}`。✅
+- `send_to_godot(g, player, ...)` 各自独立 fd + mutex。✅
 
-**`Gstreamer/main.cpp`**
-- 读配置 → 校验 `max_users`（`0 < max_users ≤ MAX_USERS_HARD` 且 `max_users == gpu_count × players_per_gpu`）。
-- 为每个 GPU `fork + execvp`（或 `posix_spawnp`）启动 Godot：
-  ```
-  godot --path <project_path> --gpu-index <g> -- --dsh-gpu=<g> --dsh-players=<n>
-  ```
-- 循环 `u`：`start_pipeline(u)`、`start_shm_frame_reader(u)`、`connect_to_signalling_server(u)`；按 GPU 启动 TCP 服务。
-- 退出时循环清理。
+**`Gstreamer/main.cpp`** ✅ 已实现（P1/P3/P4前置）
+- 校验 `max_users`（范围 + 拓扑一致性）。✅
+- 启动 Godot 子进程（`godot_process.cpp`，`godot.launch=true` 时）。✅
+- 循环 `u` 启动管线/shm/信令；按 GPU 启动 TCP。✅
+- 退出时循环清理。✅
 
-**进程编排（新增）**
-- 用 `g_child_watch_add`/`waitpid` 监听 Godot 子进程退出；崩溃按指数退避重启；`SIGINT/SIGTERM` 向所有 Godot 发 `SIGTERM` 再清理管线。
-- 维护 `gpu(g) → { godot_pid, tcp_conn }` 与 `u → (gpu, local_player)` 两张映射。
+**进程编排（新增 `godot_process.h/.cpp`）** ✅ 已实现（P4 前置）
+- `start_godot_processes()`：fork + exec Godot，传 `--dsh-gpu=<g> --dsh-players=<n>`，注入 NVIDIA PRIME 环境变量。
+- `stop_godot_processes()`：SIGTERM 优雅关停，未响应则 SIGKILL。
+- 崩溃指数退避重启（`1s→2s→…→30s`），`g_child_watch_add` + `waitpid` 回收。
+- ⬜ **尚未传 `--gpu-index <g>`**（Vulkan 物理设备选择，多 GPU 阶段 P4 补充）。
 
-### 6.2 Godot 端
+### 6.2 Godot 端 ✅ 已实现（P3）
 
 **`Godot/test/main.gd`**
-- 读 `--` 自定义参数（`OS.get_cmdline_user_args()` 的 `dsh-gpu`、`dsh-players`）确定"我是第几个实例、管几个玩家"。
-- 读 `config.json` 的 `topology.players_per_gpu`/`video`/`shm.path_template`。
-- 世界内容（StaticBody/RigidBody/WorldEnvironment/灯光）保持在共享根节点下，**不 reparent 进 SubViewport**。
-- 为本地 `k = 0..players_per_gpu-1` 各建 `SubViewport(own_world_3d=false)`，内含 `Player_k + Camera_k(current=true)`。
-- 每个 SubViewport 纹理写 `shm_<gpu*players_per_gpu+k>`。
-- 一条 TCP（连 `tcp_port_base + gpu`）接收带 `player` 字段的输入 → `NetworkInputRouter.dispatch(local_player, type, payload)`。
+- 读 `--` 自定义参数（`OS.get_cmdline_user_args()` 的 `dsh-gpu`、`dsh-players`）。✅
+- 读 `config.json` 的 `topology.players_per_gpu`/`video`/`shm.path_template`。✅
+- 世界内容保持在共享根节点下，**不 reparent 进 SubViewport**（`node_3d.tscn` 只留世界内容）。✅
+- 为本地 `k = 0..players_per_gpu-1` 各建 `SubViewport(own_world_3d=false)`，内含 `Player_k + Camera_k`（`player.tscn`）。✅
+- 每个 SubViewport 纹理写 `shm_<gpu*players_per_gpu+k>`（全局索引）。✅
+- 一条 TCP（连 `tcp_port_base + gpu`）接收带 `player` 字段的输入 → `dispatch(local_player, ...)`。✅
 
 **`Godot/test/NetworkInputRouter.gd`**
-- 从"注入全局 Input"改为"按用户分发的输入状态仓库"：`player_inputs: Dictionary`（`k -> PlayerInput`）。
-- `dispatch(k, type, payload)` 写对应玩家 `PlayerInput`。
-- 删除 `Input.action_press/release` 全局调用（多人互抢的根源）。
+- `register(k)` / `dispatch(player, type, payload)` 写对应玩家 `PlayerInput`。✅
+- 删除 `Input.action_press/release` 全局调用。✅
 
 **新增 `Godot/test/PlayerInput.gd`**
-- `move_forward/back/turn_left/turn_right`（float）+ `mouse_dx/dy`。
+- `move_forward/back/turn_left/turn_right`（bool）+ `mouse_delta`（Vector2）+ `apply_motion/consume_motion`。✅
 
 **`Godot/test/Player.gd`**
-- `_physics_process` 改读自己的 `PlayerInput`，不再读全局 `Input` 单例。
+- `_physics_process` 改读自己的 `player_input`，不再读全局 `Input` 单例。✅
 
-### 6.3 信令服务器 `signalling-server/server.js`
+**删除 `Godot/test/VirtualMouse.gd`**
+- 原全局鼠标增量单例已并入 `PlayerInput`，从 `project.godot` autoload 移除。✅
 
-- `Map<id,conn>` 已天然多 id，无需重构。
-- 新增：读 `config.json` 的 `concurrency.max_users`；`HELLO viewer_u/sender_u` 时解析尾部索引，`u ≥ max_users` 直接 `socket.destroy()`。
-- 其余转发（含 `{"input":...}` 快速通道按 `peerId` 转发）不变——每用户一对 id 天然隔离。
+### 6.3 信令服务器 `signalling-server/server.js` ✅ 已实现（P3）
 
-### 6.4 浏览器 `html/script.js` + `test.html`
+- `Map<id,conn>` 已天然多 id，无需重构。✅
+- 读 `concurrency.max_users`；`HELLO viewer_u/sender_u` 校验 `u < max_users`。✅
+- 修键名 `signalling` → `signalling_server`。✅
+- 其余转发（含 `{"input":...}` 快速通道）不变。✅
 
-- `test.html` 加用户选择（MVP 用 URL 参数 `?user=k`）。
-- `script.js`：读 `location.search` 的 `user`，设 `selfId = viewer_<u>`、`peerId = sender_<u>`；`u` 越界提示"超出并发上限"。
-- 其余收流/`getStats`/输入回传逻辑不变。
+### 6.4 浏览器 `html/script.js` + `test.html` ✅ 已实现（P3，方案比设计更进）
 
-### 6.5 nginx `nginx.conf`
+> 实际实现比设计稿更进一步：**放弃了 `?user=k` URL 参数方案**，改为**自动分配**——
+> 浏览器连接后发 `ASSIGN`，服务器分配空闲槽位返回 `ASSIGNED <k>`；全满返回
+> `ASSIGN_FAILED`，浏览器显示"无法接入会话"错误页并停止重连。用户只需访问一个 URL。
 
-- 无需改：`/ws` 已做通用 WebSocket 代理；`/config.json` 已暴露给浏览器读取 `max_users`。
+- `script.js`：连接后发 `ASSIGN`；收到 `ASSIGNED k` 设 `selfId=viewer_<k>`、`peerId=sender_<k>` 继续；收到 `ASSIGN_FAILED` 显示错误页。✅
+- `test.html`：新增错误页容器 + 用户索引显示。✅
+- 其余收流/`getStats`/输入回传逻辑不变。✅
+
+### 6.5 nginx `nginx.conf` ✅ 无需改
+
+- `/ws` 已做通用 WebSocket 代理；`/config.json` 已暴露给浏览器读取 `max_users`。
 
 ---
 
 ## 7. 分阶段落地（每步可独立验证）
 
-- **P0 基线**：单机单用户跑通，留基线。
-- **P1 配置 + 拓扑**：`config.json`/`config.json.example` 改 schema；`config.cpp` 解析拓扑 + 模板展开；`main.cpp` 加 `max_users` 强校验。`gpu_count=1, players_per_gpu=1` 回归单用户。
-- **P2 C++ 结构重构**：引入 `UserSession`，全局单例全部按 `u` 索引化；仍 `1×1` 回归。
-- **P3 单卡多玩家**：`gpu_count=1, players_per_gpu=3`，Godot 单实例 3 SubViewport + 独立输入；验证单卡 3 路 NVENC。
-- **P4 编排骨架（单卡也测）**：C++ 启动/重启 Godot 子进程，`gpu_count=1` 走通进程生命周期。
-- **P5 WSL2 双卡测试**：拿到工作站后 `gpu_count=2`，重点验 `CUDA_VISIBLE_DEVICES=0/1` 双卡编码 + 双 Godot 子进程编排。
-- **P6 原生 Linux 交付验证**：Godot `--gpu-index` 真·双卡渲染 + 满帧率。
+> 实现状态图例：✅ 已完成 · 🔶 部分完成 · ⬜ 未开始
+
+- **P0 基线** ✅：单机单用户跑通，留基线。
+- **P1 配置 + 拓扑** ✅：`config.json`/`config.json.example` 改 schema；`config.cpp` 解析拓扑 + 模板展开；`main.cpp` 加 `max_users` 强校验。`gpu_count=1, players_per_gpu=1` 回归单用户。
+- **P2 C++ 结构重构** ✅：引入 `UserSession`，全局单例全部按 `u` 索引化；仍 `1×1` 回归。
+- **P3 单卡多玩家** ✅：`gpu_count=1, players_per_gpu=3`，Godot 单实例 3 SubViewport + 独立输入；验证单卡 3 路 NVENC。浏览器端改为自动分配用户槽位（`ASSIGN` 协议），全满显示错误页。
+- **P4 编排骨架** 🔶：C++ 启动/重启 Godot 子进程（`godot_process.*`）已实现并验证（`godot.launch=true` 自动拉起、崩溃退避重启、SIGTERM 关停）；Godot 端已读 `--dsh-gpu`/`--dsh-players` 参数、shm 用全局索引。**尚未做**：每管线 CUDA 设备绑定（`cuda-device-id = gpu(u)`）、按 `gpu` 传入 `--gpu-index`、多卡实测。
+- **P5 WSL2 双卡测试** ⬜：拿到工作站后 `gpu_count=2`，重点验 `CUDA_VISIBLE_DEVICES=0/1` 双卡编码 + 双 Godot 子进程编排。
+- **P6 原生 Linux 交付验证** ⬜：Godot `--gpu-index` 真·双卡渲染 + 满帧率。
 
 ---
 

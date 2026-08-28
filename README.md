@@ -6,11 +6,12 @@
 
 | 路径 | 内容 |
 |------|------|
-| `Godot/test/` | Godot 游戏引擎（GDScript + 场景），渲染/捕获帧、接收反向输入（经 `NetworkInputRouter` / `VirtualMouse` 封装进标准 Godot 输入体系） |
-| `Gstreamer/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送 |
-| `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 |
+| `Godot/test/` | Godot 游戏引擎（GDScript + 场景），每玩家一个 SubViewport 独立渲染/捕获帧，接收反向输入（经 `NetworkInputRouter` → `PlayerInput` 分发给各玩家） |
+| `Gstreamer/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送；`godot_process.*` 负责启动/重启 Godot 子进程 |
+| `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 + 用户槽位自动分配 |
 | `html/` | 浏览器前端（WebRTC 接收端）+ nginx 配置 |
-| `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot；配置现由各子系统在运行时读取 `config.json` |
+| `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot（旧的手动启动方式，现可由 C++ 自动启动替代） |
+| `docs/` | 设计文档，含 [多用户+多 GPU 架构](docs/multi-user-multi-gpu-design.md) 与 [GPU 零拷贝分析](docs/gpu-zero-copy-design.md) |
 
 ## 依赖与工具链
 
@@ -50,7 +51,41 @@ cd ../..
 
 ## 启动流程（完整）
 
-系统由 **4 个常驻进程 + 1 个浏览器** 组成。各组件**可任意顺序启动，均会自动衔接**（见下方“启动顺序”）。
+系统支持**多用户**：每个用户一个浏览器标签页、一个 Godot 玩家实例、一路独立视频流。
+用户数量由 `config.json` 的 `topology` 与 `concurrency.max_users` 决定。
+
+启动方式有两种：
+
+### 方式 A：C++ 自动编排（推荐）
+
+`config.json` 中设 `godot.launch = true`，则由 `webrtc_sender` 自动启动 Godot 子进程，
+只需手动启动信令服务器、nginx、sender 三件套：
+
+```bash
+# 1) 信令服务器
+cd signalling-server && node server.js
+
+# 2) nginx
+nginx -c "$(pwd)/html/nginx.conf"
+
+# 3) sender（会自动 fork/exec 启动 Godot，并注入 NVIDIA PRIME 环境变量）
+cd Gstreamer && ./webrtc_sender
+```
+
+- Godot 子进程由 sender 监控，崩溃后自动指数退避重启（`1s→2s→…→30s`）。
+- sender 退出时会向 Godot 发 SIGTERM 优雅关停。
+- `godot.set_prime_env = true`（默认）时自动注入 `__NV_PRIME_RENDER_OFFLOAD=1` 等环境变量，
+  等效于旧的 `run_godot.sh`。
+
+### 方式 B：手动启动 Godot（旧流程）
+
+`config.json` 中设 `godot.launch = false`（默认），则 Godot 需手动启动：
+
+```bash
+./scripts/run_godot.sh            # 强制用 NVIDIA 独显启动
+```
+
+---
 
 ### 第 1 步：信令服务器（wss://0.0.0.0:8443）
 
@@ -71,28 +106,27 @@ nginx -c "$(pwd)/html/nginx.conf"
 
 用 `nginx -t -c <conf>` 校验配置语法；用 `nginx -s reload -c <conf>` 重载。
 
-### 第 3 步：Godot 客户端（创建共享内存帧）
+### 第 3 步：Godot（创建共享内存帧）
 
-```bash
-./scripts/run_godot.sh            # 强制用 NVIDIA 独显启动（见下方说明）
-```
-- 打开渲染窗口（分辨率/帧率取自 `config.json` 的 `video`，当前 1920×1080@60fps），创建并写入 `/dev/shm/godot_webrtc_frame`
-- 以 TCP 客户端方式连接发送端的 `9002`（未连上时会每 2 秒重试）
-- **为什么用脚本**：笔记本混合显卡（PRIME/Optimus）下，Godot 窗口失焦/最小化时系统会切到核显（iGPU）渲染，导致帧率骤降。`scripts/run_godot.sh` 通过 `__NV_PRIME_RENDER_OFFLOAD=1` 等环境变量强制使用 NVIDIA 独显，保证任何焦点状态下都用 4060。
+- **自动（推荐）**：`godot.launch=true`，由 sender 启动，无需手动操作。
+- **手动**：`./scripts/run_godot.sh`，强制用 NVIDIA 独显启动。
+
+每个 Godot 实例渲染 `players_per_gpu` 个玩家（每个玩家一个 SubViewport），
+写入 `/dev/shm/godot_webrtc_frame_<u>`（`u` 为全局用户索引，多 GPU 时为 `gpu*players_per_gpu+k`）。
 
 ### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC）
 
 ```bash
 cd Gstreamer && ./webrtc_sender
 ```
-- 打开共享内存帧并启动读取线程（零拷贝）
-- 监听 TCP `9002` 接收 Godot 控制通道（输入事件）
-- 连接信令服务器 `wss://127.0.0.1:8443`，注册为 `cpp_sender`，等待浏览器 `browser` 对端
+- 按 `max_users` 启动对应数量的 GStreamer 管线与 shm 读取线程（零拷贝）
+- 按 GPU 启动 TCP 控制通道（端口 `tcp_port_base + gpu`），接收输入并带 `player` 索引转发
+- 每用户一对信令 id：`sender_<u>` ↔ `viewer_<u>`
 
 ### 第 5 步：浏览器（WebRTC 接收端）
 
-用浏览器打开 `https://127.0.0.1:8444/`（页面里的 `script.js` 会自动完成
-信令与 WebRTC 握手、拉流并播放）。
+用浏览器打开 `https://127.0.0.1:8444/`（**无需任何 URL 参数**）。信令服务器会
+自动分配一个空闲用户槽位；当所有槽位已满时，页面显示"无法接入会话"错误页。
 
 ---
 
@@ -100,18 +134,15 @@ cd Gstreamer && ./webrtc_sender
 
 各组件**不依赖启动顺序**，可任意先后启动，均能自动衔接：
 
-- **共享内存帧**：`webrtc_sender` 的读帧线程会在 `/dev/shm/godot_webrtc_frame` 不存在时
+- **共享内存帧**：`webrtc_sender` 的读帧线程会在 `/dev/shm/godot_webrtc_frame_<u>` 不存在时
   每 1 秒重试打开。因此无论 Godot 先起还是 sender 先起，只要文件一出现，sender 就会
   自动读取；Godot 运行中途重建该文件（分辨率变更 / 重启）也会被 sender 自动跟随
   （限频约 1 秒检测一次 inode，发现变化即重新打开，无需重启 sender）。
 - **信令 WebSocket**：sender 在信令服务器未启动或中途断开时**不会退出**，而是按
-  `1s→2s→4s→…→30s` 退避在后台重连；重新连上后会自动重新声明 `SESSION browser`
-  并触发重新协商。浏览器端本身就带指数退避重连。
-- **TCP 控制通道**：Godot 每 2 秒重连 sender 的 TCP `9002`，天然无先后依赖。
-
-> 旧版本曾要求“先 Godot → 再 sender → 最后浏览器”。现在无需遵守该顺序。
-> 唯一仍属“协商”性质的耦合是 WebRTC 的 offer/answer（浏览器作为对端），
-> 但这一点由浏览器连上后发送 `{reset}`、以及 sender 重连后重新协商自动兜底。
+  `1s→2s→4s→…→30s` 退避在后台重连；重新连上后会自动重新声明会话并触发重新协商。
+  浏览器端本身就带指数退避重连。
+- **TCP 控制通道**：Godot 每 2 秒重连 sender 的 TCP（`tcp_port_base + gpu`），天然无先后依赖。
+- **用户槽位**：浏览器关闭后其槽位自动释放，供下一个用户分配。
 
 ---
 
@@ -121,45 +152,49 @@ cd Gstreamer && ./webrtc_sender
 |------|------|------|
 | 8080 | nginx | HTTP，`301` 重定向到 8444 |
 | 8444 | nginx (HTTPS) | 浏览器前端页面 |
-| 8443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 |
-| 9002 | webrtc_sender (TCP) | 接收 Godot 控制输入通道 |
+| 8443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 / 用户槽位分配 |
+| 9002 + gpu | webrtc_sender (TCP) | 每 GPU 一条，接收该 GPU 的 Godot 控制输入通道（单 GPU 为 9002） |
 
-共享内存：`/dev/shm/godot_webrtc_frame`（零拷贝帧传输，1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。
+共享内存：`/dev/shm/godot_webrtc_frame_<u>`，每个用户一个文件（零拷贝帧传输，
+1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。`u` 为全局用户索引，多 GPU 时为
+`gpu*players_per_gpu+k`。
 
 ## 输入系统与后续开发注意
 
-Godot 端已把"网络输入"封装进标准的 Godot 输入体系，**游戏逻辑可照 Godot 官方文档开发**。
-数据流：`浏览器 → 信令服务器 → webrtc_sender → TCP 9002 → main.gd → NetworkInputRouter → Input 单例 → Player`。
+多用户场景下，Godot 端把"网络输入"按**玩家索引**分发，每个玩家一份独立输入状态，
+彻底隔离（否则多人会互相抢占）。数据流：
 
-### 两端分层
+`浏览器 → 信令服务器 → webrtc_sender → TCP → main.gd → NetworkInputRouter.dispatch(player, ...) → PlayerInput → Player`
 
-- **游戏逻辑（照 Godot 文档）**：`Player.gd` 用标准 `Input` API（`Input.get_axis()`）读取动作；
-  动作定义在 `project.godot` 的 `[input]`（四个动作 `move_forward` / `move_back` / `turn_left` / `turn_right`）。
-- **自定义输入桥（需自己维护）**：
-  - `NetworkInputRouter`（autoload）把浏览器按键翻译成逻辑动作，再 `Input.action_press()` 注入；
-  - `VirtualMouse`（autoload）把 `mousemove` 的归一化坐标转成增量（delta）。
-  这两个 autoload 均已在 `project.godot` 的 `[autoload]` 注册。
+### 分层
 
-### 关键差异：输入是"远程"的
+- **游戏逻辑**：`Player.gd` 读**自己的** `PlayerInput`（`player_input.move_forward` 等），
+  不再读全局 `Input` 单例。
+- **输入状态**：`PlayerInput.gd`（`class_name PlayerInput`）每玩家一份，存四个动作 bool + 鼠标增量。
+- **输入分发**：`NetworkInputRouter.gd`（autoload）维护 `register(k)` / `dispatch(player, type, payload)`，
+  把浏览器按键写入对应玩家的 `PlayerInput`。
 
-`[input]` 里四个动作的 `events` **均为空**，没有绑定本地物理键——真正触发靠
-`NetworkInputRouter` 调用 `Input.action_press()`，而不是本地键盘事件。因此：
+### 关键差异：输入是"远程"的，且按玩家隔离
+
+`project.godot` 的 `[input]` 四个动作的 `events` **均为空**，没有绑定本地物理键——真正触发靠
+`NetworkInputRouter` 写入对应 `PlayerInput`。因此：
 
 - 在编辑器里给 `InputMap` 添加物理键**不会**生效（浏览器不经过本地事件）；
-- 新增输入必须**同时**改三处：
+- 新增输入动作需改：
   1. `NetworkInputRouter.gd` 的 `ACTION_MAP` 加一行映射（如 `"KeySpace": &"jump"`）；
-  2. `project.godot` 的 `[input]` 加"空事件"动作（如 `jump={ "deadzone": 0.5, "events": [] }`）；
-  3. 消费脚本（如 `Player.gd`）用标准 `Input` API 读取。
+  2. `PlayerInput.gd` 加对应状态字段（如 `var jump := false`）；
+  3. `NetworkInputRouter._set_action` 加对应写入分支；
+  4. 消费脚本（如 `Player.gd`）读自己的 `player_input`。
 
 > 浏览器端 `html/script.js` 已**无差别转发所有 `keydown`**（带 `key` / `code`），新增键盘键**无需**改浏览器；
 > 若新增加鼠标/滚轮等事件，则需在 `script.js` 的 `sendInput` 处补发。
 
 ### 两个容易踩的坑
 
-- **键盘自动重复**：按住键浏览器会连续触发 `keydown`。`Input.is_action_just_pressed` 只在
-  "未按→按下"过渡帧为真，一般够用；但"跳跃"这类一次性动作若出现重复触发，需自行去重。
+- **键盘自动重复**：按住键浏览器会连续触发 `keydown`。需要"仅按下瞬间"的一次性动作
+  （如跳跃）需自行去重。
 - **鼠标坐标是归一化的（0~1）**：`mousemove` 给的是相对 `video` 元素的归一化坐标，不是位移增量。
-  所以鼠标视角**不能**按 `InputEventMouseMotion` 那套写，要用 `VirtualMouse` 取增量再驱动相机。
+  已在 `PlayerInput.apply_motion` 里转成增量，相机等消费方调 `consume_motion()` 取走并清零。
 
 ### 视频流（非 Godot 文档范围）
 
@@ -184,7 +219,7 @@ pkill -f '[w]ebrtc_sender' 2>/dev/null || true
 pkill -f '[n]ode server\.js' 2>/dev/null || true
 
 # 5) 删除共享内存帧文件（下次启动会重新创建）
-rm -f /dev/shm/godot_webrtc_frame
+rm -f /dev/shm/godot_webrtc_frame_*
 ```
 
 ### 确认已关闭
@@ -272,12 +307,13 @@ cd Gstreamer && make
 
 | 现象 | 原因 / 解决 |
 |------|------|
-| `open(/dev/shm/godot_webrtc_frame) failed ... retrying in 1s` | **正常自愈过程**：Godot 尚未创建 shm 文件。sender 会每 1 秒重试，文件出现后自动开始读帧；无需重启任何进程。 |
+| `open(/dev/shm/godot_webrtc_frame_<u>) failed ... retrying in 1s` | **正常自愈过程**：Godot 尚未创建 shm 文件。sender 会每 1 秒重试，文件出现后自动开始读帧；无需重启任何进程。 |
 | `SHM file size mismatch ... retrying in 1s` | **正常自愈过程**：Godot 将按新分辨率重建 shm 文件；sender 检测到尺寸/ inode 变化后自动重新打开。若几十秒后仍无画面，检查配置是否已在设备/重启后同步。 |
 | `SHM file was re-created by Godot, re-opening` | **自愈成功的日志**：sender 检测到 Godot 重建了文件并已自动重新映射，无需干预。 |
 | `Reconnecting to signalling server in Ns` | **正常的自动重连**：程序未退出，会退避重连；请确认信令服务器已启动。 |
-| 信令日志一直 `Peer X not connected` | 目标对端还没连上信令：浏览器未打开，或发送端未注册为 `cpp_sender`。各端连上后会自动重新协商。 |
+| 信令日志一直 `Peer X not connected` | 目标对端还没连上信令：浏览器未打开，或发送端未注册。各端连上后会自动重新协商。 |
+| 浏览器显示"无法接入会话" | 所有用户槽位已满；关闭其他标签页释放槽位，或增大 `config.json` 的 `concurrency.max_users`。 |
 | 浏览器弹“连接不安全” | 自签证书未被信任；导入 `dev-cert.pem` 或在告警页点“继续”。 |
 | `nvautogpuh264enc` 初始化失败 / `nvidia-smi` 报错 | 无 NVIDIA GPU 或驱动；改用软件编码（改 `config.json` 的 `encoding`）。 |
 | Godot「未找到 config.json，使用内置默认值」 | 属正常回退（Godot 用内置默认值，与 `config.json` 一致），不影响运行。 |
-| 页面能开但视频黑屏 | 检查 Godot 是否已连上 sender 的 TCP `9002`、是否已写入 shm 帧、NVENC 是否可用。 |
+| 页面能开但视频黑屏 | 检查 Godot 是否已连上 sender 的 TCP、是否已写入 shm 帧、NVENC 是否可用。 |
