@@ -1,4 +1,4 @@
-# Godot → WebRTC 低延迟流式传输系统
+# CloudVR
 
 本仓库是 TECHNICAL.md 所描述系统的源码版本仓库。采用 Git 管理，包含四个核心子系统和部署配置。详细架构请阅读 [TECHNICAL.md](./TECHNICAL.md)。
 

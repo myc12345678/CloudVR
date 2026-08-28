@@ -7,8 +7,9 @@
 #include "config.h"
 #include "signalling.h"
 
-void push_raw_frame_to_appsrc(const uint8_t *data, size_t size) {
-  GstElement *current_appsrc = appsrc;
+void push_raw_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
+  UserSession &s = session(u);
+  GstElement *current_appsrc = s.appsrc;
   if (!current_appsrc || size == 0)
     return;
 
@@ -18,7 +19,7 @@ void push_raw_frame_to_appsrc(const uint8_t *data, size_t size) {
 
   gst_buffer_fill(buffer, 0, data, size);
 
-  uint64_t frame_index = frame_counter.fetch_add(1);
+  uint64_t frame_index = s.frame_counter.fetch_add(1);
   GST_BUFFER_PTS(buffer) =
       gst_util_uint64_scale(frame_index, GST_SECOND, g_config.frame_fps);
   GST_BUFFER_DURATION(buffer) =
@@ -35,8 +36,8 @@ void push_raw_frame_to_appsrc(const uint8_t *data, size_t size) {
 }
 
 // 保留旧名称作为别名，兼容 tcp_server.cpp 中的调用
-void push_jpeg_frame_to_appsrc(const uint8_t *data, size_t size) {
-  push_raw_frame_to_appsrc(data, size);
+void push_jpeg_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
+  push_raw_frame_to_appsrc(u, data, size);
 }
 
 // ======================== 管线错误自复位 ========================
@@ -45,33 +46,33 @@ void push_jpeg_frame_to_appsrc(const uint8_t *data, size_t size) {
 // 而不是退出进程（配合信令自动重连，做到不易崩溃）。
 
 static const unsigned MAX_PIPELINE_RESETS = 5;
-static unsigned pipeline_error_resets = 0;
 
-static void maybe_reset_pipeline() {
-  static uint64_t last_reset_ms = 0;
+static void maybe_reset_pipeline(int u) {
+  UserSession &s = session(u);
   uint64_t now = now_ms();
 
-  if (pipeline_error_resets >= MAX_PIPELINE_RESETS) {
+  if (s.pipeline_error_resets >= MAX_PIPELINE_RESETS) {
     std::cerr << "Pipeline error persists; auto-reset disabled ("
-              << pipeline_error_resets << " resets). Staying running."
+              << s.pipeline_error_resets << " resets). Staying running."
               << std::endl;
     return;
   }
-  if (now - last_reset_ms < 3000) { // 3s 冷却，避免反复自旋
+  if (now - s.last_reset_ms < 3000) { // 3s 冷却，避免反复自旋
     std::cerr << "Pipeline error too soon after last reset; backing off."
               << std::endl;
     return;
   }
 
-  last_reset_ms = now;
-  pipeline_error_resets++;
-  std::cerr << "Resetting pipeline (attempt " << pipeline_error_resets << "/"
+  s.last_reset_ms = now;
+  s.pipeline_error_resets++;
+  std::cerr << "Resetting pipeline (attempt " << s.pipeline_error_resets << "/"
             << MAX_PIPELINE_RESETS << ")..." << std::endl;
-  stop_pipeline();
-  start_pipeline();
+  stop_pipeline(u);
+  start_pipeline(u);
 }
 
-static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer /*data*/) {
+static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer data) {
+  int u = GPOINTER_TO_INT(data);
   switch (GST_MESSAGE_TYPE(msg)) {
   case GST_MESSAGE_ERROR: {
     GError *err;
@@ -83,12 +84,12 @@ static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer /*data*/) {
     g_error_free(err);
     g_free(debug);
     // 不再直接退出进程，改为带冷却地自复位管线（可自愈瞬时错误）。
-    maybe_reset_pipeline();
+    maybe_reset_pipeline(u);
     break;
   }
   case GST_MESSAGE_EOS:
     std::cout << "EOS (end of stream)" << std::endl;
-    maybe_reset_pipeline();
+    maybe_reset_pipeline(u);
     break;
   default:
     break;
@@ -108,11 +109,13 @@ static constexpr char QUEUE_ARGS[] =
 //     → cudaupload → nvh264enc → rtph264pay → webrtcbin (零拷贝上传到 GPU)
 //   - 软件 VP8 路径: appsrc → queue → videoconvert → queue
 //     → vp8enc → rtpvp8pay → webrtcbin
-static std::string build_pipeline_desc() {
+// element 名按用户 u 唯一命名（webrtc<u> / godotsrc<u>），避免多管线重名。
+static std::string build_pipeline_desc(int u) {
   std::ostringstream desc;
-  desc << "webrtcbin name=webrtc bundle-policy=max-bundle "
+  desc << "webrtcbin name=webrtc" << u << " bundle-policy=max-bundle "
        << "stun-server=stun://stun.l.google.com:19302 "
-       << "appsrc name=godotsrc is-live=true format=time do-timestamp=true "
+       << "appsrc name=godotsrc" << u
+       << " is-live=true format=time do-timestamp=true "
        << "caps=video/x-raw,format=RGB,"
        << "width=" << g_config.frame_width << ","
        << "height=" << g_config.frame_height << ","
@@ -138,79 +141,85 @@ static std::string build_pipeline_desc() {
          << " ! ";
   }
 
-  desc << "queue ! webrtc.";
+  desc << "queue ! webrtc" << u << ".";
   return desc.str();
 }
 
-void start_pipeline() {
-  static const std::string s_pipeline_desc = build_pipeline_desc();
-  static const char *pipeline_desc = s_pipeline_desc.c_str();
+void start_pipeline(int u) {
+  UserSession &s = session(u);
+  const std::string desc_str = build_pipeline_desc(u);
+  const char *pipeline_desc = desc_str.c_str();
   GError *error = nullptr;
-  pipeline = gst_parse_launch(pipeline_desc, &error);
+  s.pipeline = gst_parse_launch(pipeline_desc, &error);
   if (error) {
     std::cerr << "Pipeline create failed: " << error->message << std::endl;
     g_error_free(error);
     return;
   }
 
-  webrtcbin = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
-  appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "godotsrc");
-  frame_counter = 0;
+  s.webrtcbin = gst_bin_get_by_name(GST_BIN(s.pipeline),
+                                    ("webrtc" + std::to_string(u)).c_str());
+  s.appsrc = gst_bin_get_by_name(GST_BIN(s.pipeline),
+                                 ("godotsrc" + std::to_string(u)).c_str());
+  s.frame_counter = 0;
 
-  if (appsrc) {
-    g_object_set(appsrc, "stream-type", GST_APP_STREAM_TYPE_STREAM, "format",
+  if (s.appsrc) {
+    g_object_set(s.appsrc, "stream-type", GST_APP_STREAM_TYPE_STREAM, "format",
                  GST_FORMAT_TIME, "block", TRUE, nullptr);
-    gst_app_src_set_max_buffers(GST_APP_SRC(appsrc), 2);
-    gst_app_src_set_leaky_type(GST_APP_SRC(appsrc),
+    gst_app_src_set_max_buffers(GST_APP_SRC(s.appsrc), 2);
+    gst_app_src_set_leaky_type(GST_APP_SRC(s.appsrc),
                                GST_APP_LEAKY_TYPE_DOWNSTREAM);
   }
 
   // 设置 webrtcbin 低延迟模式
-  g_object_set(webrtcbin, "latency", 0, nullptr);
+  g_object_set(s.webrtcbin, "latency", 0, nullptr);
 
   // 设置 RTP 负载器的 config-interval=-1，使每个关键帧都附带 SPS/PPS
   // 避免浏览器因等待参数集而增加解码启动延迟
-  GstElement *rtp_pay = gst_bin_get_by_name(GST_BIN(pipeline), "rtph264pay0");
+  GstElement *rtp_pay = gst_bin_get_by_name(GST_BIN(s.pipeline), "rtph264pay0");
   if (rtp_pay) {
     g_object_set(rtp_pay, "config-interval", -1, nullptr);
     g_object_unref(rtp_pay);
   }
 
-  connect_webrtc_signals(webrtcbin);
+  connect_webrtc_signals(s.webrtcbin, u);
 
-  GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-  bus_watch_id = gst_bus_add_watch(bus, bus_call, nullptr);
+  GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(s.pipeline));
+  s.bus_watch_id =
+      gst_bus_add_watch(bus, bus_call, GINT_TO_POINTER(u));
   g_object_unref(bus);
 
-  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  gst_element_set_state(s.pipeline, GST_STATE_PLAYING);
 }
 
-void stop_pipeline() {
+void stop_pipeline(int u) {
+  UserSession &s = session(u);
+
   // 1. 先停止总线监听，防止后续信号触发旧回调
-  if (bus_watch_id > 0) {
-    g_source_remove(bus_watch_id);
-    bus_watch_id = 0;
+  if (s.bus_watch_id > 0) {
+    g_source_remove(s.bus_watch_id);
+    s.bus_watch_id = 0;
   }
 
   // 2. 先设置 pipeline 为 NULL 状态，停止所有数据流和信号触发
-  if (pipeline) {
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+  if (s.pipeline) {
+    gst_element_set_state(s.pipeline, GST_STATE_NULL);
   }
 
   // 3. 在 pipeline 销毁前释放我们持有的子元素引用
   //    （此时 pipeline 仍存活，子元素安全可操作）
-  if (webrtcbin) {
-    g_object_unref(webrtcbin);
-    webrtcbin = nullptr;
+  if (s.webrtcbin) {
+    g_object_unref(s.webrtcbin);
+    s.webrtcbin = nullptr;
   }
-  if (appsrc) {
-    g_object_unref(appsrc);
-    appsrc = nullptr;
+  if (s.appsrc) {
+    g_object_unref(s.appsrc);
+    s.appsrc = nullptr;
   }
 
   // 4. 最后销毁 pipeline（它的析构会级联释放所有剩余子元素）
-  if (pipeline) {
-    gst_object_unref(pipeline);
-    pipeline = nullptr;
+  if (s.pipeline) {
+    gst_object_unref(s.pipeline);
+    s.pipeline = nullptr;
   }
 }

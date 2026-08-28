@@ -68,36 +68,44 @@ int main(int argc, char *argv[]) {
   std::cout << "topology: gpu_count=" << g_config.gpu_count
             << " players_per_gpu=" << g_config.players_per_gpu
             << " max_users=" << g_config.max_users << std::endl;
-  // P1 校验模板展开（u=0）；后续阶段由 UserSession 按 u 消费，旧键退场。
-  std::cout << "derived[u=0]: shm="
-            << expand_index_template(g_config.shm_path_template, 0)
-            << " sender=" << expand_index_template(g_config.sender_id_template, 0)
-            << " viewer=" << expand_index_template(g_config.viewer_id_template, 0)
-            << std::endl;
 
-  // 同步 signalling.cpp 中使用的全局 peer/self id
-  self_id = g_config.self_id;
-  peer_id = g_config.peer_id;
+  // ---- P2：初始化每个用户的会话状态 ----
+  // 派生 gpu(u) = u / players_per_gpu, local_player(u) = u % players_per_gpu。
+  // P2 阶段保持旧键/旧路径，行为与单用户一致；P3 起切换为模板展开值。
+  for (int u = 0; u < g_config.max_users; ++u) {
+    UserSession &s = session(u);
+    s.index = u;
+    s.gpu = u / g_config.players_per_gpu;
+    s.local_player = u % g_config.players_per_gpu;
+    s.sender_id = g_config.self_id;   // P2 用旧键
+    s.viewer_id = g_config.peer_id;   // P2 用旧键
+    s.shm_path = g_config.shm_path;   // P2 用旧路径
+    s.tcp_port = g_config.godot_tcp_port; // P2 用旧键
+  }
 
-  start_pipeline();
-  start_godot_tcp_server(); // TCP 输入控制指令（保留）
-  start_shm_frame_reader(); // 共享内存视频帧（零拷贝，优选）
-
-  // 连接 signalling server (WSS)。
-  // 注意：即使信令服务器尚未启动 / 中途断开，sender 也不会退出，
-  // 而是持续在后台重连（见 signalling.cpp）。因此这里不再做硬性失败退出。
-  connect_to_signalling_server();
+  // ---- 逐用户启动管线 / TCP / shm / 信令 ----
+  for (int u = 0; u < g_config.max_users; ++u) {
+    start_pipeline(u);
+    start_godot_tcp_server(u); // TCP 输入控制指令（保留）
+    start_shm_frame_reader(u); // 共享内存视频帧（零拷贝，优选）
+    // 连接 signalling server (WSS)。
+    // 注意：即使信令服务器尚未启动 / 中途断开，sender 也不会退出，
+    // 而是持续在后台重连（见 signalling.cpp）。因此这里不再做硬性失败退出。
+    connect_to_signalling_server(u);
+  }
 
   g_main_loop_run(loop);
 
-  // 清理
-  stop_shm_frame_reader();
-  stop_godot_tcp_server();
-  if (ws_conn)
-    g_object_unref(ws_conn);
+  // ---- 逐用户清理 ----
+  for (int u = 0; u < g_config.max_users; ++u) {
+    stop_shm_frame_reader(u);
+    stop_godot_tcp_server(u);
+    if (session(u).ws_conn)
+      g_object_unref(session(u).ws_conn);
+    stop_pipeline(u);
+  }
   if (soup_session)
     g_object_unref(soup_session);
-  stop_pipeline();
   g_main_loop_unref(loop);
   return 0;
 }

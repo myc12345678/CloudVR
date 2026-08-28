@@ -12,22 +12,19 @@
 #include "pipeline.h"
 #include "tcp_server.h"
 
-// ---- 信令重连状态（文件内私有） ----
-// 这些只在主循环线程访问，无需原子；websocket 连接完成标志也仅主循环线程读写。
-static unsigned sign_reconnect_attempts = 0;
-static guint sign_reconnect_source = 0;
-static bool ws_handshake_done = false;
+// ---- 信令重连状态（现按用户索引 u 存入 UserSession）----
 
 // 前向声明（互相调用）
-static void schedule_signalling_reconnect();
-static gboolean try_connect_signalling(gpointer);
-static void start_signalling_connect();
+static void schedule_signalling_reconnect(int u);
+static gboolean try_connect_signalling(gpointer data);
+static void start_signalling_connect(int u);
 
 // ======================== JSON 工具 ========================
 
-static void send_text(const std::string &text) {
-  if (ws_conn) {
-    soup_websocket_connection_send_text(ws_conn, text.c_str());
+static void send_text(int u, const std::string &text) {
+  UserSession &s = session(u);
+  if (s.ws_conn) {
+    soup_websocket_connection_send_text(s.ws_conn, text.c_str());
     std::cout << "SEND: " << text << std::endl;
   }
 }
@@ -47,7 +44,7 @@ static gchar *json_object_to_string(JsonObject *obj) {
 
 // ======================== 发送信令消息 ========================
 
-static void send_sdp_to_peer(const gchar *type,
+static void send_sdp_to_peer(int u, const gchar *type,
                              GstWebRTCSessionDescription *desc) {
   gchar *sdp_string = gst_sdp_message_as_text(desc->sdp);
 
@@ -59,13 +56,13 @@ static void send_sdp_to_peer(const gchar *type,
   json_object_set_object_member(msg, "sdp", sdp);
 
   gchar *text = json_object_to_string(msg);
-  send_text(text);
+  send_text(u, text);
 
   g_free(text);
   g_free(sdp_string);
 }
 
-static void send_ice_to_peer(guint mlineindex, const gchar *candidate) {
+static void send_ice_to_peer(int u, guint mlineindex, const gchar *candidate) {
   JsonObject *ice = json_object_new();
   json_object_set_int_member(ice, "sdpMLineIndex", mlineindex);
   json_object_set_string_member(ice, "candidate", candidate);
@@ -74,37 +71,41 @@ static void send_ice_to_peer(guint mlineindex, const gchar *candidate) {
   json_object_set_object_member(msg, "ice", ice);
 
   gchar *text = json_object_to_string(msg);
-  send_text(text);
+  send_text(u, text);
 
   g_free(text);
 }
 
 // ======================== WebRTC 信号回调 ========================
 
-static void on_offer_created(GstPromise *promise, gpointer) {
+static void on_offer_created(GstPromise *promise, gpointer data) {
+  int u = GPOINTER_TO_INT(data);
   const GstStructure *reply = gst_promise_get_reply(promise);
   GstWebRTCSessionDescription *offer = nullptr;
   gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer,
                     nullptr);
   gst_promise_unref(promise);
 
-  g_signal_emit_by_name(webrtcbin, "set-local-description", offer, nullptr);
-  send_sdp_to_peer("offer", offer);
+  g_signal_emit_by_name(session(u).webrtcbin, "set-local-description", offer,
+                        nullptr);
+  send_sdp_to_peer(u, "offer", offer);
 
   gst_webrtc_session_description_free(offer);
 }
 
-static void on_negotiation_needed(GstElement *element, gpointer) {
-  std::cout << "on_negotiation_needed" << std::endl;
-  GstPromise *promise =
-      gst_promise_new_with_change_func(on_offer_created, nullptr, nullptr);
+static void on_negotiation_needed(GstElement *element, gpointer data) {
+  int u = GPOINTER_TO_INT(data);
+  std::cout << "on_negotiation_needed (u=" << u << ")" << std::endl;
+  GstPromise *promise = gst_promise_new_with_change_func(
+      on_offer_created, GINT_TO_POINTER(u), nullptr);
   g_signal_emit_by_name(element, "create-offer", nullptr, promise);
 }
 
 static void on_ice_candidate(GstElement *, guint mlineindex, gchar *candidate,
-                             gpointer) {
+                             gpointer data) {
+  int u = GPOINTER_TO_INT(data);
   std::cout << "Local ICE candidate: " << candidate << std::endl;
-  send_ice_to_peer(mlineindex, candidate);
+  send_ice_to_peer(u, mlineindex, candidate);
 }
 
 static void on_set_description_promise_result(GstPromise *promise,
@@ -128,7 +129,8 @@ static void on_set_description_promise_result(GstPromise *promise,
 
 // 异步 create-answer 完成回调
 static void on_create_answer_promise_done(GstPromise *promise,
-                                          gpointer /*user_data*/) {
+                                          gpointer data) {
+  int u = GPOINTER_TO_INT(data);
   const GstStructure *reply = gst_promise_get_reply(promise);
   GstWebRTCSessionDescription *local_answer = nullptr;
   gst_structure_get(reply, "answer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION,
@@ -138,15 +140,15 @@ static void on_create_answer_promise_done(GstPromise *promise,
   GstPromise *set_local_promise = gst_promise_new_with_change_func(
       on_set_description_promise_result, (gpointer) "set-local-description",
       nullptr);
-  g_signal_emit_by_name(webrtcbin, "set-local-description", local_answer,
-                        set_local_promise);
+  g_signal_emit_by_name(session(u).webrtcbin, "set-local-description",
+                        local_answer, set_local_promise);
 
-  send_sdp_to_peer("answer", local_answer);
+  send_sdp_to_peer(u, "answer", local_answer);
   gst_webrtc_session_description_free(local_answer);
   gst_promise_unref(promise);
 }
 
-static void handle_sdp(JsonObject *sdp_json) {
+static void handle_sdp(int u, JsonObject *sdp_json) {
   const gchar *type = json_object_get_string_member(sdp_json, "type");
   const gchar *sdp_str = json_object_get_string_member(sdp_json, "sdp");
 
@@ -174,29 +176,30 @@ static void handle_sdp(JsonObject *sdp_json) {
   GstPromise *set_remote_promise = gst_promise_new_with_change_func(
       on_set_description_promise_result, (gpointer) "set-remote-description",
       nullptr);
-  g_signal_emit_by_name(webrtcbin, "set-remote-description", desc,
+  g_signal_emit_by_name(session(u).webrtcbin, "set-remote-description", desc,
                         set_remote_promise);
 
   if (!is_answer) {
     // 异步创建 answer，不阻塞 glib 主循环
     GstPromise *promise = gst_promise_new_with_change_func(
-        on_create_answer_promise_done, nullptr, nullptr);
-    g_signal_emit_by_name(webrtcbin, "create-answer", nullptr, promise);
+        on_create_answer_promise_done, GINT_TO_POINTER(u), nullptr);
+    g_signal_emit_by_name(session(u).webrtcbin, "create-answer", nullptr,
+                          promise);
   }
 
   gst_webrtc_session_description_free(desc);
 }
 
-static void handle_ice(JsonObject *ice_json) {
+static void handle_ice(int u, JsonObject *ice_json) {
   guint sdpMLineIndex = json_object_get_int_member(ice_json, "sdpMLineIndex");
   const gchar *candidate = json_object_get_string_member(ice_json, "candidate");
 
   std::cout << "Remote ICE candidate: " << candidate << std::endl;
-  g_signal_emit_by_name(webrtcbin, "add-ice-candidate", sdpMLineIndex,
-                        candidate);
+  g_signal_emit_by_name(session(u).webrtcbin, "add-ice-candidate",
+                        sdpMLineIndex, candidate);
 }
 
-static void handle_input_message(const std::string &raw_input_json) {
+static void handle_input_message(int u, const std::string &raw_input_json) {
   // 跳过 json-glib 解析/重序列化，直接从原始字符串提取 input 对象转发
   // 格式: {"input":{"type":"keydown","key":"w","code":"KeyW"}}
   // 提取内层 { ... } 部分，即 prefix="{\"input\":" 之后、最外层 } 之前
@@ -213,10 +216,10 @@ static void handle_input_message(const std::string &raw_input_json) {
 
   std::string inner =
       raw_input_json.substr(inner_start, inner_end - inner_start);
-  send_to_godot(inner.c_str(), inner.size());
+  send_to_godot(u, inner.c_str(), inner.size());
 }
 
-static void handle_json_message(const gchar *text) {
+static void handle_json_message(int u, const gchar *text) {
   JsonParser *parser = json_parser_new();
   GError *error = nullptr;
 
@@ -246,7 +249,7 @@ static void handle_json_message(const gchar *text) {
       JsonGenerator *gen = json_generator_new();
       json_generator_set_root(gen, input_root);
       gchar *text = json_generator_to_data(gen, nullptr);
-      send_to_godot(text, strlen(text));
+      send_to_godot(u, text, strlen(text));
       g_free(text);
       g_object_unref(gen);
       json_node_free(input_root);
@@ -257,18 +260,18 @@ static void handle_json_message(const gchar *text) {
 
   if (json_object_has_member(obj, "reset")) {
     g_print("Received reset, triggering renegotiation\n");
-    stop_pipeline();
-    start_pipeline();
+    stop_pipeline(u);
+    start_pipeline(u);
     g_object_unref(parser);
     return;
   }
 
   if (json_object_has_member(obj, "sdp")) {
     JsonObject *sdp = json_object_get_object_member(obj, "sdp");
-    handle_sdp(sdp);
+    handle_sdp(u, sdp);
   } else if (json_object_has_member(obj, "ice")) {
     JsonObject *ice = json_object_get_object_member(obj, "ice");
-    handle_ice(ice);
+    handle_ice(u, ice);
   }
 
   g_object_unref(parser);
@@ -278,20 +281,22 @@ static void handle_json_message(const gchar *text) {
 
 static void on_ws_message(SoupWebsocketConnection *,
                           SoupWebsocketDataType /*type*/, GBytes *message,
-                          gpointer) {
+                          gpointer data) {
+  int u = GPOINTER_TO_INT(data);
+  UserSession &s = session(u);
   gsize size = 0;
-  const gchar *data = (const gchar *)g_bytes_get_data(message, &size);
-  std::string msg(data, size);
+  const gchar *data_bytes = (const gchar *)g_bytes_get_data(message, &size);
+  std::string msg(data_bytes, size);
 
   if (msg.rfind("HELLO", 0) == 0) {
     std::cout << "RECV: " << msg << std::endl;
-    if (!session_started) {
-      send_text("SESSION " + peer_id);
-      session_started = true;
+    if (!s.session_started) {
+      send_text(u, "SESSION " + s.viewer_id);
+      s.session_started = true;
       // 握手完成后强制重新协商，保证无论哪一端先启动都能重新发出 offer，
       // 覆盖“先开 sender 后开浏览器 / sender 单独重连”等所有时序。
-      stop_pipeline();
-      start_pipeline();
+      stop_pipeline(u);
+      start_pipeline(u);
     }
     return;
   }
@@ -303,24 +308,26 @@ static void on_ws_message(SoupWebsocketConnection *,
   if (!msg.empty() && msg[0] == '{') {
     // 输入消息走快速通道：跳过 json-glib 解析，直接转发给 Godot
     if (msg.rfind(R"({"input":)", 0) == 0) {
-      handle_input_message(msg);
+      handle_input_message(u, msg);
       return;
     }
-    handle_json_message(msg.c_str());
+    handle_json_message(u, msg.c_str());
   }
 }
 
-static void on_ws_closed(SoupWebsocketConnection *conn, gpointer) {
+static void on_ws_closed(SoupWebsocketConnection *conn, gpointer data) {
+  int u = GPOINTER_TO_INT(data);
+  UserSession &s = session(u);
   std::cout << "WebSocket closed" << std::endl;
   if (conn) {
     g_signal_handlers_disconnect_by_data(conn, nullptr);
     g_object_unref(conn);
   }
-  ws_conn = nullptr;
-  ws_handshake_done = false;
-  session_started = false;
+  s.ws_conn = nullptr;
+  s.ws_handshake_done = false;
+  s.session_started = false;
   if (!shutting_down.load()) {
-    schedule_signalling_reconnect();
+    schedule_signalling_reconnect(u);
   }
 }
 
@@ -334,38 +341,41 @@ static gboolean on_accept_certificate(SoupMessage *, GTlsCertificate *,
 }
 
 static void on_server_connected(GObject *, GAsyncResult *res,
-                                gpointer user_data) {
-  SoupSession *session = SOUP_SESSION(user_data);
+                                gpointer data) {
+  int u = GPOINTER_TO_INT(data);
+  UserSession &s = session(u);
   GError *error = nullptr;
 
-  ws_conn = soup_session_websocket_connect_finish(session, res, &error);
+  s.ws_conn = soup_session_websocket_connect_finish(soup_session, res, &error);
   if (error) {
     std::cerr << "WebSocket connect failed: " << error->message << std::endl;
     g_error_free(error);
-    ws_conn = nullptr;
+    s.ws_conn = nullptr;
     if (!shutting_down.load()) {
-      schedule_signalling_reconnect();
+      schedule_signalling_reconnect(u);
     }
     return;
   }
 
   std::cout << "WebSocket connected" << std::endl;
-  sign_reconnect_attempts = 0;
-  ws_handshake_done = true;
+  s.sign_reconnect_attempts = 0;
+  s.ws_handshake_done = true;
 
-  g_signal_connect(ws_conn, "message", G_CALLBACK(on_ws_message), nullptr);
-  g_signal_connect(ws_conn, "closed", G_CALLBACK(on_ws_closed), nullptr);
+  g_signal_connect(s.ws_conn, "message", G_CALLBACK(on_ws_message),
+                   GINT_TO_POINTER(u));
+  g_signal_connect(s.ws_conn, "closed", G_CALLBACK(on_ws_closed),
+                   GINT_TO_POINTER(u));
 
-  send_text("HELLO " + self_id);
+  send_text(u, "HELLO " + s.sender_id);
 }
 
 // ======================== 对外接口 ========================
 
-void connect_webrtc_signals(GstElement *webrtc) {
+void connect_webrtc_signals(GstElement *webrtc, int u) {
   g_signal_connect(webrtc, "on-negotiation-needed",
-                   G_CALLBACK(on_negotiation_needed), nullptr);
+                   G_CALLBACK(on_negotiation_needed), GINT_TO_POINTER(u));
   g_signal_connect(webrtc, "on-ice-candidate", G_CALLBACK(on_ice_candidate),
-                   nullptr);
+                   GINT_TO_POINTER(u));
 }
 
 // ======================== 信令连接 / 自动重连 ========================
@@ -377,39 +387,42 @@ void connect_webrtc_signals(GstElement *webrtc) {
 static const unsigned SIGNAL_RECONNECT_MAX_DELAY_S = 30;
 
 // 调度一次带退避的重连（幂等：已有一个待触发的重连则忽略）
-static void schedule_signalling_reconnect() {
+static void schedule_signalling_reconnect(int u) {
+  UserSession &s = session(u);
   if (shutting_down.load())
     return;
-  if (sign_reconnect_source != 0)
+  if (s.sign_reconnect_source != 0)
     return;
 
   unsigned delay_s =
-      sign_reconnect_attempts >= 5
+      s.sign_reconnect_attempts >= 5
           ? SIGNAL_RECONNECT_MAX_DELAY_S
-          : (1u << sign_reconnect_attempts); // 1,2,4,8,16 → 封顶 30s
-  sign_reconnect_attempts++;
+          : (1u << s.sign_reconnect_attempts); // 1,2,4,8,16 → 封顶 30s
+  s.sign_reconnect_attempts++;
   std::cout << "Reconnecting to signalling server in " << delay_s << "s"
             << std::endl;
-  sign_reconnect_source =
-      g_timeout_add_seconds(delay_s, try_connect_signalling, nullptr);
+  s.sign_reconnect_source =
+      g_timeout_add_seconds(delay_s, try_connect_signalling, GINT_TO_POINTER(u));
 }
 
-static gboolean try_connect_signalling(gpointer) {
-  sign_reconnect_source = 0;
+static gboolean try_connect_signalling(gpointer data) {
+  int u = GPOINTER_TO_INT(data);
+  session(u).sign_reconnect_source = 0;
   if (shutting_down.load())
     return G_SOURCE_REMOVE;
-  start_signalling_connect();
+  start_signalling_connect(u);
   return G_SOURCE_REMOVE;
 }
 
-void connect_to_signalling_server() {
-  start_signalling_connect();
+void connect_to_signalling_server(int u) {
+  start_signalling_connect(u);
 }
 
-static void start_signalling_connect() {
+static void start_signalling_connect(int u) {
+  UserSession &s = session(u);
   if (shutting_down.load())
     return;
-  if (ws_handshake_done)
+  if (s.ws_handshake_done)
     return; // 已连接
 
   if (!soup_session) {
@@ -422,7 +435,7 @@ static void start_signalling_connect() {
                 << std::endl;
       if (tls_error)
         g_error_free(tls_error);
-      schedule_signalling_reconnect();
+      schedule_signalling_reconnect(u);
       return;
     }
     soup_session = soup_session_new();
@@ -435,6 +448,6 @@ static void start_signalling_connect() {
                    nullptr);
   soup_session_websocket_connect_async(soup_session, msg, nullptr, nullptr,
                                        G_PRIORITY_DEFAULT, nullptr,
-                                       on_server_connected, soup_session);
+                                       on_server_connected, GINT_TO_POINTER(u));
   g_object_unref(msg);
 }

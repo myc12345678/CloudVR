@@ -51,9 +51,6 @@ static bool read_exact(int fd, void *buffer, size_t size) {
 
 // ======================== 发送数据给 Godot ========================
 
-static std::thread tcp_thread;
-static std::mutex tcp_client_mutex;
-
 static ssize_t send_all(int fd, const void *buf, size_t len) {
   auto *p = static_cast<const uint8_t *>(buf);
   size_t total = 0;
@@ -77,12 +74,13 @@ static ssize_t send_all(int fd, const void *buf, size_t len) {
   return static_cast<ssize_t>(total);
 }
 
-void send_to_godot(const void *data, size_t size) {
+void send_to_godot(int u, const void *data, size_t size) {
   if (!data || size == 0)
     return;
 
-  std::lock_guard<std::mutex> lock(tcp_client_mutex);
-  int fd = tcp_client_fd;
+  UserSession &s = session(u);
+  std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
+  int fd = s.tcp_client_fd;
   if (fd < 0)
     return;
 
@@ -106,14 +104,16 @@ void send_to_godot(const void *data, size_t size) {
 
 // ======================== TCP 服务主循环 ========================
 
-static void tcp_server_loop() {
-  while (tcp_running.load()) {
+static void tcp_server_loop(int u) {
+  UserSession &s = session(u);
+  while (s.tcp_running.load()) {
     sockaddr_in client_addr{};
     socklen_t client_len = sizeof(client_addr);
     int client_fd = accept(
-        tcp_server_fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+        s.tcp_server_fd, reinterpret_cast<sockaddr *>(&client_addr),
+        &client_len);
     if (client_fd < 0) {
-      if (tcp_running.load()) {
+      if (s.tcp_running.load()) {
         std::cerr << "accept() failed: " << std::strerror(errno) << std::endl;
       }
       // 如果是 EBADF，说明 tcp_server_fd 已被 stop 方关闭，
@@ -143,12 +143,12 @@ static void tcp_server_loop() {
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     {
-      std::lock_guard<std::mutex> lock(tcp_client_mutex);
-      tcp_client_fd = client_fd;
+      std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
+      s.tcp_client_fd = client_fd;
     }
     std::cout << "Godot TCP client connected" << std::endl;
 
-    while (tcp_running.load()) {
+    while (s.tcp_running.load()) {
       uint32_t net_len = 0;
       if (!read_exact(client_fd, &net_len, sizeof(net_len)))
         break;
@@ -163,15 +163,15 @@ static void tcp_server_loop() {
       if (!read_exact(client_fd, jpeg.data(), frame_len))
         break;
 
-      push_jpeg_frame_to_appsrc(reinterpret_cast<const uint8_t *>(jpeg.data()),
+      push_jpeg_frame_to_appsrc(u, reinterpret_cast<const uint8_t *>(jpeg.data()),
                                 jpeg.size());
     }
 
     std::cout << "Godot TCP client disconnected" << std::endl;
     {
-      std::lock_guard<std::mutex> lock(tcp_client_mutex);
+      std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
       close(client_fd);
-      tcp_client_fd = -1;
+      s.tcp_client_fd = -1;
     }
   }
 }
@@ -182,42 +182,42 @@ static void tcp_server_loop() {
 // /dev/shm/godot_webrtc_frame，Gstreamer 端零拷贝读取。
 // 读取端自动跳过中间帧（天然帧丢弃），延迟从 TCP 的 ms 级降至 μs 级。
 
-static std::thread shm_thread;
-
 // 共享内存文件是否已被 Godot 重建（inode 变化）或消失。
 // 只在限频检查时调用，绝不会进入每帧热路径。
-static bool shm_path_replaced() {
+static bool shm_path_replaced(int u) {
+  UserSession &s = session(u);
   struct stat path_st{};
-  if (stat(g_config.shm_path.c_str(), &path_st) != 0) {
+  if (stat(s.shm_path.c_str(), &path_st) != 0) {
     return true; // 文件已被删除 → 需要重新打开
   }
   struct stat fd_st{};
-  if (fstat(shm_fd, &fd_st) != 0) {
+  if (fstat(s.shm_fd, &fd_st) != 0) {
     return true;
   }
   return (path_st.st_dev != fd_st.st_dev) || (path_st.st_ino != fd_st.st_ino);
 }
 
-static void shm_reader_loop() {
+static void shm_reader_loop(int u) {
+  UserSession &s = session(u);
   uint64_t last_counter = 0;
   uint64_t last_inode_check = 0;
 
   std::cout << "Shared memory frame reader started" << std::endl;
 
-  while (shm_running.load(std::memory_order_acquire)) {
+  while (s.shm_running.load(std::memory_order_acquire)) {
     // ---- 确保映射存在 / 最新：只在尚未映射或映射失效时执行，不进帧热路径 ----
-    if (!shm_frame) {
-      if (shm_fd >= 0) {
-        close(shm_fd);
-        shm_fd = -1;
+    if (!s.shm_frame) {
+      if (s.shm_fd >= 0) {
+        close(s.shm_fd);
+        s.shm_fd = -1;
       }
 
       // Godot 使用 FileAccess 写入普通文件到 /dev/shm，
       // 因此这里用 open() 而非 shm_open() 打开同一文件。
       // /dev/shm 是 tmpfs，文件内容即驻留在 RAM 中，mmap 实现零拷贝。
-      shm_fd = open(g_config.shm_path.c_str(), O_RDONLY);
-      if (shm_fd < 0) {
-        std::cerr << "open(" << g_config.shm_path
+      s.shm_fd = open(s.shm_path.c_str(), O_RDONLY);
+      if (s.shm_fd < 0) {
+        std::cerr << "open(" << s.shm_path
                   << ") failed: " << std::strerror(errno)
                   << " -- waiting for Godot to create it, retrying in 1s"
                   << std::endl;
@@ -228,53 +228,53 @@ static void shm_reader_loop() {
       // 检测文件大小是否与运行期（由 config.json 的宽高推导）的 SHM 总大小匹配。
       // 分辨率变更后 Godot 会重建文件；尺寸不符则等 Godot 重建后重试，而非报错退出。
       struct stat st{};
-      if (fstat(shm_fd, &st) == 0 &&
+      if (fstat(s.shm_fd, &st) == 0 &&
           static_cast<off_t>(st.st_size) !=
               static_cast<off_t>(g_config.shm_total_size)) {
         std::cerr << "SHM file size mismatch: file=" << st.st_size
                   << " expected=" << g_config.shm_total_size
                   << " -- waiting for Godot to recreate it, retrying in 1s"
                   << std::endl;
-        close(shm_fd);
-        shm_fd = -1;
+        close(s.shm_fd);
+        s.shm_fd = -1;
         usleep(1000000);
         continue;
       }
 
-      shm_frame = static_cast<SharedFrameHeader *>(
-          mmap(nullptr, g_config.shm_total_size, PROT_READ, MAP_SHARED, shm_fd,
-               0));
-      if (shm_frame == MAP_FAILED) {
+      s.shm_frame = static_cast<SharedFrameHeader *>(
+          mmap(nullptr, g_config.shm_total_size, PROT_READ, MAP_SHARED,
+               s.shm_fd, 0));
+      if (s.shm_frame == MAP_FAILED) {
         std::cerr << "mmap failed: " << std::strerror(errno) << std::endl;
-        close(shm_fd);
-        shm_fd = -1;
-        shm_frame = nullptr;
+        close(s.shm_fd);
+        s.shm_fd = -1;
+        s.shm_frame = nullptr;
         usleep(1000000);
         continue;
       }
 
       last_counter = 0;
       last_inode_check = now_ms();
-      std::cout << "Reading frames from shared memory " << g_config.shm_path
+      std::cout << "Reading frames from shared memory " << s.shm_path
                 << " (zero-copy, " << g_config.shm_frame_max_size
                 << " bytes/frame)" << std::endl;
     }
 
     // ---- 每帧热路径（与原有逻辑一致，无新增 syscall） ----
-    uint64_t current = shm_frame->write_counter.load(std::memory_order_acquire);
+    uint64_t current = s.shm_frame->write_counter.load(std::memory_order_acquire);
     if (current == last_counter) {
       // 无新帧时休眠 3ms，避免高频轮询浪费 CPU。
       // 同时做限频的 inode 完整性检查（约 1 次/秒），检测 Godot 重建文件。
       uint64_t now = now_ms();
       if (now - last_inode_check >= 1000) {
         last_inode_check = now;
-        if (shm_path_replaced()) {
+        if (shm_path_replaced(u)) {
           std::cerr << "SHM file was re-created by Godot, re-opening"
                     << std::endl;
-          if (shm_frame && shm_frame != MAP_FAILED) {
-            munmap(shm_frame, g_config.shm_total_size);
+          if (s.shm_frame && s.shm_frame != MAP_FAILED) {
+            munmap(s.shm_frame, g_config.shm_total_size);
           }
-          shm_frame = nullptr;
+          s.shm_frame = nullptr;
           continue; // 下一轮循环重新打开
         }
       }
@@ -287,7 +287,7 @@ static void shm_reader_loop() {
 
     // 自旋等待写入完成（通常极短，几十纳秒），加入 yield 避免忙等
     int spin_count = 0;
-    while (!shm_frame->ready.load(std::memory_order_acquire)) {
+    while (!s.shm_frame->ready.load(std::memory_order_acquire)) {
       if (++spin_count > 1000) {
         // 超过 1000 次自旋仍未完成，让渡 CPU 时间片并重置计数
         std::this_thread::yield();
@@ -295,110 +295,114 @@ static void shm_reader_loop() {
       }
     }
 
-    uint32_t frame_sz = shm_frame->frame_size.load(std::memory_order_acquire);
+    uint32_t frame_sz = s.shm_frame->frame_size.load(std::memory_order_acquire);
     if (frame_sz > 0 && frame_sz <= g_config.shm_frame_max_size) {
       // 数据紧随 16 字节头部之后
       const uint8_t *frame_data =
-          reinterpret_cast<const uint8_t *>(shm_frame) + SHM_FRAME_HEADER_SIZE;
-      push_raw_frame_to_appsrc(frame_data, frame_sz);
+          reinterpret_cast<const uint8_t *>(s.shm_frame) + SHM_FRAME_HEADER_SIZE;
+      push_raw_frame_to_appsrc(u, frame_data, frame_sz);
     }
   }
 
   std::cout << "Shared memory frame reader stopped" << std::endl;
 }
 
-void start_shm_frame_reader() {
-  if (shm_running.load())
+void start_shm_frame_reader(int u) {
+  UserSession &s = session(u);
+  if (s.shm_running.load())
     return;
 
-  if (shm_thread.joinable())
-    shm_thread.join();
+  if (s.shm_thread.joinable())
+    s.shm_thread.join();
 
-  shm_running = true;
-  shm_thread = std::thread(shm_reader_loop);
+  s.shm_running = true;
+  s.shm_thread = std::thread(shm_reader_loop, u);
 }
 
-void stop_shm_frame_reader() {
-  shm_running = false;
+void stop_shm_frame_reader(int u) {
+  UserSession &s = session(u);
+  s.shm_running = false;
 
-  if (shm_thread.joinable())
-    shm_thread.join();
+  if (s.shm_thread.joinable())
+    s.shm_thread.join();
 
-  if (shm_frame && shm_frame != MAP_FAILED) {
-    munmap(shm_frame, g_config.shm_total_size);
-    shm_frame = nullptr;
+  if (s.shm_frame && s.shm_frame != MAP_FAILED) {
+    munmap(s.shm_frame, g_config.shm_total_size);
+    s.shm_frame = nullptr;
   }
 
-  if (shm_fd >= 0) {
-    close(shm_fd);
-    shm_fd = -1;
+  if (s.shm_fd >= 0) {
+    close(s.shm_fd);
+    s.shm_fd = -1;
   }
 }
 
 // ======================== TCP 服务管理 ========================
 
-void start_godot_tcp_server() {
-  if (tcp_running.load())
+void start_godot_tcp_server(int u) {
+  UserSession &s = session(u);
+  if (s.tcp_running.load())
     return;
 
   // 确保旧线程已结束再启动新线程，避免 std::terminate
-  if (tcp_thread.joinable())
-    tcp_thread.join();
+  if (s.tcp_thread.joinable())
+    s.tcp_thread.join();
 
-  tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (tcp_server_fd < 0) {
+  s.tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (s.tcp_server_fd < 0) {
     std::cerr << "socket() failed: " << std::strerror(errno) << std::endl;
     return;
   }
 
   int opt = 1;
-  setsockopt(tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(s.tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(g_config.godot_tcp_port);
+  addr.sin_port = htons(s.tcp_port);
 
-  if (bind(tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
+  if (bind(s.tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
       0) {
     std::cerr << "bind() failed: " << std::strerror(errno) << std::endl;
-    close(tcp_server_fd);
-    tcp_server_fd = -1;
+    close(s.tcp_server_fd);
+    s.tcp_server_fd = -1;
     return;
   }
 
-  if (listen(tcp_server_fd, 1) < 0) {
+  if (listen(s.tcp_server_fd, 1) < 0) {
     std::cerr << "listen() failed: " << std::strerror(errno) << std::endl;
-    close(tcp_server_fd);
-    tcp_server_fd = -1;
+    close(s.tcp_server_fd);
+    s.tcp_server_fd = -1;
     return;
   }
 
-  tcp_running = true;
-  tcp_thread = std::thread(tcp_server_loop);
-  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:"
-            << g_config.godot_tcp_port << std::endl;
+  s.tcp_running = true;
+  s.tcp_thread = std::thread(tcp_server_loop, u);
+  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:" << s.tcp_port
+            << std::endl;
 }
 
-void stop_godot_tcp_server() {
-  tcp_running = false;
+void stop_godot_tcp_server(int u) {
+  UserSession &s = session(u);
+  s.tcp_running = false;
 
   {
-    std::lock_guard<std::mutex> lock(tcp_client_mutex);
-    if (tcp_client_fd >= 0) {
+    std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
+    if (s.tcp_client_fd >= 0) {
       // 用 shutdown 唤醒可能阻塞在 recv() 的线程，不直接 close
       // close 由 tcp_server_loop 中在锁保护下执行
-      shutdown(tcp_client_fd, SHUT_RDWR);
+      shutdown(s.tcp_client_fd, SHUT_RDWR);
     }
   }
 
-  if (tcp_server_fd >= 0) {
+  if (s.tcp_server_fd >= 0) {
     // shutdown 让阻塞在 accept() 的线程返回 -1，之后由线程自然退出
-    shutdown(tcp_server_fd, SHUT_RDWR);
-    close(tcp_server_fd);
-    tcp_server_fd = -1;
+    shutdown(s.tcp_server_fd, SHUT_RDWR);
+    close(s.tcp_server_fd);
+    s.tcp_server_fd = -1;
   }
 
-  if (tcp_thread.joinable())
-    tcp_thread.join();
+  if (s.tcp_thread.joinable())
+    s.tcp_thread.join();
 }
