@@ -41,6 +41,8 @@ var _expected_len: int = 0
 
 func _ready() -> void:
 	_load_config()
+	# 启动参数（--dsh-gpu/--dsh-players）优先于 config，多 GPU 时由 C++ 传入。
+	_load_launch_args()
 	# 将窗口渲染分辨率设为目标大小，省去 send_frame 中的 CPU resize()
 	get_window().set_size(Vector2i(TARGET_WIDTH, TARGET_HEIGHT))
 	# 关键：窗口最小化/失焦时也要持续渲染帧，否则共享内存帧会被冻结、
@@ -74,6 +76,19 @@ func _setup_players() -> void:
 
 		_players.append(player)
 		_player_inputs.append(input)
+
+
+# 从启动参数 -- --dsh-gpu=<g> --dsh-players=<n> 读取本实例的 GPU 索引与玩家数。
+# 由 C++ sender 启动时传入（godot_process.cpp）；手动启动 Godot 时这些参数缺省，
+# 退化为 GPU_INDEX=0、PLAYERS_PER_GPU 取 config 的 topology.players_per_gpu。
+func _load_launch_args() -> void:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--dsh-gpu="):
+			GPU_INDEX = int(arg.substr("--dsh-gpu=".length()))
+		elif arg.begins_with("--dsh-players="):
+			PLAYERS_PER_GPU = int(arg.substr("--dsh-players=".length()))
+	# 每个 Godot 实例连它自己 GPU 对应的 TCP 控制通道：tcp_port_base + gpu。
+	GSTREAMER_PORT = GSTREAMER_PORT + GPU_INDEX
 
 
 # 从项目根目录的 config.json 加载所有运行参数
@@ -137,8 +152,10 @@ func _load_config() -> void:
 
 
 # 展开 shm 路径模板中的 {index} 占位符（与 C++ 端 expand_index_template 一致）。
+# 用全局用户索引 = gpu * players_per_gpu + k，保证多 GPU 时各实例写不同文件。
 func _shm_path_for(k: int) -> String:
-	return SHM_PATH_TEMPLATE.replace("{index}", str(k))
+	var global_index := GPU_INDEX * PLAYERS_PER_GPU + k
+	return SHM_PATH_TEMPLATE.replace("{index}", str(global_index))
 
 
 func _open_shm() -> void:

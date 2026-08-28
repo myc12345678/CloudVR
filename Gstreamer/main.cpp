@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "godot_process.h"
 #include "pipeline.h"
 #include "signalling.h"
 #include "tcp_server.h"
@@ -87,6 +88,10 @@ int main(int argc, char *argv[]) {
     gpu_tcp(g).tcp_port = g_config.tcp_port_base + g;
   }
 
+  // ---- 启动 Godot 子进程（若 godot.launch=true）----
+  // 先启动 Godot，让它有时间创建 shm 帧文件；后续 shm 读取线程会自动等待。
+  start_godot_processes();
+
   // ---- 逐用户启动管线 / shm / 信令 ----
   for (int u = 0; u < g_config.max_users; ++u) {
     start_pipeline(u);
@@ -104,6 +109,8 @@ int main(int argc, char *argv[]) {
   g_main_loop_run(loop);
 
   // ---- 逐 GPU / 逐用户清理 ----
+  // 先关停 Godot 子进程（停止写帧），再清理读取端
+  stop_godot_processes();
   for (int g = 0; g < g_config.gpu_count; ++g) {
     stop_godot_tcp_server(g);
   }

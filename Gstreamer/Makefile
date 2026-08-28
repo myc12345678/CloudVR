@@ -1,6 +1,6 @@
 CXX      := g++
 TARGET   := webrtc_sender
-SRCS     := main.cpp common.cpp config.cpp tcp_server.cpp pipeline.cpp signalling.cpp
+SRCS     := main.cpp common.cpp config.cpp tcp_server.cpp pipeline.cpp signalling.cpp godot_process.cpp
 OBJS     := $(SRCS:.cpp=.o)
 
 # pkg-config packages

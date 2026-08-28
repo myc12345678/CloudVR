@@ -34,6 +34,9 @@ struct Config {
   int godot_tcp_port = 9002; // 旧键（单用户），后续阶段由 tcp_port_base 派生
   int tcp_port_base = 9002;  // 每 GPU 一条 TCP：端口 = tcp_port_base + gpu
   std::string godot_project_path; // Godot 项目目录（后续阶段用于启动子进程）
+  std::string godot_binary = "godot"; // Godot 可执行文件（P4 前置：C++ 启动 Godot 用）
+  bool godot_launch = false; // 是否由 C++ 自动启动 Godot（false=手动启动，兼容旧流程）
+  bool godot_set_prime_env = true; // 启动 Godot 时是否注入 NVIDIA PRIME 环境变量
 
   // ---- Signalling (WebSocket) ----
   std::string self_id = "cpp_sender"; // 旧键（单用户）

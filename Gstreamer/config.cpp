@@ -124,6 +124,15 @@ bool load_config(Config &cfg, const std::string &config_path) {
     cfg.tcp_port_base = get_int(g, "tcp_port_base", cfg.tcp_port_base);
     cfg.godot_project_path =
         get_string(g, "project_path", cfg.godot_project_path);
+    cfg.godot_binary = get_string(g, "binary", cfg.godot_binary);
+    if (has_scalar(g, "launch")) {
+      cfg.godot_launch = json_node_get_boolean(
+          json_object_get_member(g, "launch"));
+    }
+    if (has_scalar(g, "set_prime_env")) {
+      cfg.godot_set_prime_env = json_node_get_boolean(
+          json_object_get_member(g, "set_prime_env"));
+    }
   }
 
   // ---- gstreamer (signalling) ----

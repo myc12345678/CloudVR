@@ -15,7 +15,10 @@
     "gstreamer_host": "127.0.0.1",
     "tcp_port": 9002,
     "tcp_port_base": 9002,
-    "project_path": "/ABSOLUTE/PATH/TO/Godot/test"
+    "project_path": "/ABSOLUTE/PATH/TO/Godot/test",
+    "binary": "godot",
+    "launch": false,
+    "set_prime_env": true
   },
   "gstreamer": {
     "self_id": "cpp_sender",
