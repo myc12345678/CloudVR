@@ -74,29 +74,44 @@ static ssize_t send_all(int fd, const void *buf, size_t len) {
   return static_cast<ssize_t>(total);
 }
 
-void send_to_godot(int u, const void *data, size_t size) {
+void send_to_godot(int gpu, int player, const void *data, size_t size) {
   if (!data || size == 0)
     return;
 
-  UserSession &s = session(u);
-  std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
-  int fd = s.tcp_client_fd;
+  GpuTcpState &t = gpu_tcp(gpu);
+  std::lock_guard<std::mutex> lock(t.tcp_client_mutex);
+  int fd = t.tcp_client_fd;
   if (fd < 0)
     return;
 
+  // data 是 Godot 端输入的 JSON 内层（形如 {"type":"keydown",...}），这里注入
+  // "player" 字段供 Godot 端路由到对应玩家，变为 {"player":k,"type":...}。
+  // 保持无 json-glib 解析的快速通道（高频 keydown/mousemove）。
+  std::string inner(static_cast<const char *>(data), size);
+  std::string payload;
+  if (!inner.empty() && inner[0] == '{') {
+    payload = "{\"player\":" + std::to_string(player) + "," + inner.substr(1);
+  } else {
+    // 兜底：非 JSON 开头时也强制包一层 player 字段
+    payload = "{\"player\":" + std::to_string(player) + ",\"raw\":\"" +
+              inner + "\"}";
+  }
+
+  const size_t payload_size = payload.size();
+
   // 4 字节大端长度头
   uint8_t header[4];
-  header[0] = static_cast<uint8_t>((size >> 24) & 0xFF);
-  header[1] = static_cast<uint8_t>((size >> 16) & 0xFF);
-  header[2] = static_cast<uint8_t>((size >> 8) & 0xFF);
-  header[3] = static_cast<uint8_t>(size & 0xFF);
+  header[0] = static_cast<uint8_t>((payload_size >> 24) & 0xFF);
+  header[1] = static_cast<uint8_t>((payload_size >> 16) & 0xFF);
+  header[2] = static_cast<uint8_t>((payload_size >> 8) & 0xFF);
+  header[3] = static_cast<uint8_t>(payload_size & 0xFF);
 
   if (send_all(fd, header, 4) < 0) {
     std::cerr << "send_to_godot: failed to send header" << std::endl;
     return;
   }
 
-  if (send_all(fd, data, size) < 0) {
+  if (send_all(fd, payload.data(), payload_size) < 0) {
     std::cerr << "send_to_godot: failed to send payload" << std::endl;
     return;
   }
@@ -104,16 +119,16 @@ void send_to_godot(int u, const void *data, size_t size) {
 
 // ======================== TCP 服务主循环 ========================
 
-static void tcp_server_loop(int u) {
-  UserSession &s = session(u);
-  while (s.tcp_running.load()) {
+static void tcp_server_loop(int gpu) {
+  GpuTcpState &t = gpu_tcp(gpu);
+  while (t.tcp_running.load()) {
     sockaddr_in client_addr{};
     socklen_t client_len = sizeof(client_addr);
     int client_fd = accept(
-        s.tcp_server_fd, reinterpret_cast<sockaddr *>(&client_addr),
+        t.tcp_server_fd, reinterpret_cast<sockaddr *>(&client_addr),
         &client_len);
     if (client_fd < 0) {
-      if (s.tcp_running.load()) {
+      if (t.tcp_running.load()) {
         std::cerr << "accept() failed: " << std::strerror(errno) << std::endl;
       }
       // 如果是 EBADF，说明 tcp_server_fd 已被 stop 方关闭，
@@ -143,12 +158,12 @@ static void tcp_server_loop(int u) {
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     {
-      std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
-      s.tcp_client_fd = client_fd;
+      std::lock_guard<std::mutex> lock(t.tcp_client_mutex);
+      t.tcp_client_fd = client_fd;
     }
     std::cout << "Godot TCP client connected" << std::endl;
 
-    while (s.tcp_running.load()) {
+    while (t.tcp_running.load()) {
       uint32_t net_len = 0;
       if (!read_exact(client_fd, &net_len, sizeof(net_len)))
         break;
@@ -163,15 +178,18 @@ static void tcp_server_loop(int u) {
       if (!read_exact(client_fd, jpeg.data(), frame_len))
         break;
 
+      // 该 GPU 的 TCP 上目前不区分玩家（视频帧回传是旧 TCP 路径，已废弃）。
+      // push_jpeg_frame_to_appsrc 需要 u，这里用该 GPU 的首个用户 u=gpu*players_per_gpu。
+      int u = gpu * g_config.players_per_gpu;
       push_jpeg_frame_to_appsrc(u, reinterpret_cast<const uint8_t *>(jpeg.data()),
                                 jpeg.size());
     }
 
     std::cout << "Godot TCP client disconnected" << std::endl;
     {
-      std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
+      std::lock_guard<std::mutex> lock(t.tcp_client_mutex);
       close(client_fd);
-      s.tcp_client_fd = -1;
+      t.tcp_client_fd = -1;
     }
   }
 }
@@ -339,70 +357,70 @@ void stop_shm_frame_reader(int u) {
 
 // ======================== TCP 服务管理 ========================
 
-void start_godot_tcp_server(int u) {
-  UserSession &s = session(u);
-  if (s.tcp_running.load())
+void start_godot_tcp_server(int gpu) {
+  GpuTcpState &t = gpu_tcp(gpu);
+  if (t.tcp_running.load())
     return;
 
   // 确保旧线程已结束再启动新线程，避免 std::terminate
-  if (s.tcp_thread.joinable())
-    s.tcp_thread.join();
+  if (t.tcp_thread.joinable())
+    t.tcp_thread.join();
 
-  s.tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (s.tcp_server_fd < 0) {
+  t.tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (t.tcp_server_fd < 0) {
     std::cerr << "socket() failed: " << std::strerror(errno) << std::endl;
     return;
   }
 
   int opt = 1;
-  setsockopt(s.tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(t.tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(s.tcp_port);
+  addr.sin_port = htons(t.tcp_port);
 
-  if (bind(s.tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
+  if (bind(t.tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
       0) {
     std::cerr << "bind() failed: " << std::strerror(errno) << std::endl;
-    close(s.tcp_server_fd);
-    s.tcp_server_fd = -1;
+    close(t.tcp_server_fd);
+    t.tcp_server_fd = -1;
     return;
   }
 
-  if (listen(s.tcp_server_fd, 1) < 0) {
+  if (listen(t.tcp_server_fd, 1) < 0) {
     std::cerr << "listen() failed: " << std::strerror(errno) << std::endl;
-    close(s.tcp_server_fd);
-    s.tcp_server_fd = -1;
+    close(t.tcp_server_fd);
+    t.tcp_server_fd = -1;
     return;
   }
 
-  s.tcp_running = true;
-  s.tcp_thread = std::thread(tcp_server_loop, u);
-  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:" << s.tcp_port
+  t.tcp_running = true;
+  t.tcp_thread = std::thread(tcp_server_loop, gpu);
+  std::cout << "Waiting for Godot frames on tcp://0.0.0.0:" << t.tcp_port
             << std::endl;
 }
 
-void stop_godot_tcp_server(int u) {
-  UserSession &s = session(u);
-  s.tcp_running = false;
+void stop_godot_tcp_server(int gpu) {
+  GpuTcpState &t = gpu_tcp(gpu);
+  t.tcp_running = false;
 
   {
-    std::lock_guard<std::mutex> lock(s.tcp_client_mutex);
-    if (s.tcp_client_fd >= 0) {
+    std::lock_guard<std::mutex> lock(t.tcp_client_mutex);
+    if (t.tcp_client_fd >= 0) {
       // 用 shutdown 唤醒可能阻塞在 recv() 的线程，不直接 close
       // close 由 tcp_server_loop 中在锁保护下执行
-      shutdown(s.tcp_client_fd, SHUT_RDWR);
+      shutdown(t.tcp_client_fd, SHUT_RDWR);
     }
   }
 
-  if (s.tcp_server_fd >= 0) {
+  if (t.tcp_server_fd >= 0) {
     // shutdown 让阻塞在 accept() 的线程返回 -1，之后由线程自然退出
-    shutdown(s.tcp_server_fd, SHUT_RDWR);
-    close(s.tcp_server_fd);
-    s.tcp_server_fd = -1;
+    shutdown(t.tcp_server_fd, SHUT_RDWR);
+    close(t.tcp_server_fd);
+    t.tcp_server_fd = -1;
   }
 
-  if (s.tcp_thread.joinable())
-    s.tcp_thread.join();
+  if (t.tcp_thread.joinable())
+    t.tcp_thread.join();
 }

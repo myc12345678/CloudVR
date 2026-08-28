@@ -1,9 +1,12 @@
 const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${wsScheme}//${location.host}/ws`;
 
-// 运行时从 config.json 加载（由 nginx 在 /config.json 暴露）。默认值兜底。
-let selfId = 'browser';
-let peerId = 'cpp_sender';
+// 用户索引由信令服务器自动分配（连接后发 ASSIGN，服务器返回 ASSIGNED <k>）。
+// 分配前为 null，分配后确定 selfId=viewer_<k>、peerId=sender_<k>。
+let userIndex = null;
+let selfId = '';
+let peerId = '';
+let maxUsers = 0; // 从 config.json 的 concurrency.max_users 读取，仅用于展示
 
 const logBox = document.getElementById('logBox');
 const heroStatus = document.getElementById('heroStatus');
@@ -28,13 +31,12 @@ async function loadRuntimeConfig() {
     const resp = await fetch('config.json', { cache: 'no-store' });
     if (resp.ok) {
       const cfg = await resp.json();
-      const g = cfg && cfg.gstreamer;
-      if (g) {
-        // 浏览器自身 ID 是 sender 的 peer，目标 peer 是 sender 的 self
-        if (g.peer_id) selfId = g.peer_id;
-        if (g.self_id) peerId = g.self_id;
-        console.log('[config] 已从 config.json 加载运行时配置', { selfId, peerId });
+      // 并发上限：来自 config.json 的 concurrency.max_users，仅用于展示。
+      const c = cfg && cfg.concurrency;
+      if (c && typeof c.max_users === 'number') {
+        maxUsers = c.max_users;
       }
+      console.log('[config] 已从 config.json 加载运行时配置', { maxUsers });
     } else {
       console.warn('[config] 读取 config.json 失败 HTTP ' + resp.status + '，使用内置默认值');
     }
@@ -99,6 +101,8 @@ function updateHero(text) {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
+  // 分配失败后不再重连（reconnectAttempts 被置为 -1）
+  if (reconnectAttempts < 0) return;
 
   // 指数退避: 1s, 2s, 4s, 8s, 16s, 最大 30s
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS);
@@ -144,7 +148,8 @@ function connectWebSocket() {
     // 重置 WebRTC 状态（重连时需要重新协商）
     resetWebRTC();
 
-    ws.send('HELLO ' + selfId);
+    // 自动分配：向信令服务器请求一个空闲的 viewer 槽位
+    ws.send('ASSIGN');
 
     // 启动心跳定时器，防止 nginx 因超时断开 WebSocket 连接
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -180,6 +185,35 @@ function connectWebSocket() {
     log('WS RECV:', data);
 
     if (typeof data === 'string') {
+      if (data.startsWith('ASSIGNED ')) {
+        // 服务器分配了一个槽位：ASSIGNED <k>
+        const k = parseInt(data.substring('ASSIGNED '.length).trim(), 10);
+        if (!Number.isFinite(k)) {
+          log('无效的 ASSIGNED 响应:', data);
+          return;
+        }
+        userIndex = k;
+        selfId = `viewer_${k}`;
+        peerId = `sender_${k}`;
+        document.getElementById('userIndexText').textContent = userIndex;
+        document.getElementById('selfIdText').textContent = selfId;
+        document.getElementById('peerIdText').textContent = peerId;
+        document.getElementById('peerLabel').textContent = peerId;
+        document.getElementById('selfLabel').textContent = selfId;
+        log(`已分配用户 ${k}，selfId=${selfId}, peerId=${peerId}`);
+        updateHero('\u5DF2\u5206\u914D\u7528\u6237\uFF0C\u51C6\u5907\u5EFA\u7ACB\u4F1A\u8BDD');
+        ws.send('SESSION ' + peerId);
+        return;
+      }
+
+      if (data.startsWith('ASSIGN_FAILED')) {
+        // 所有槽位已满：显示错误页，不再重连
+        const reason = data.substring('ASSIGN_FAILED '.length);
+        log('分配失败:', reason);
+        showAssignFailed(reason);
+        return;
+      }
+
       if (data.startsWith('HELLO_OK')) {
         ws.send('SESSION ' + peerId);
         updateHero('\u5DF2\u6CE8\u518C\uFF0C\u51C6\u5907\u5EFA\u7ACB\u4F1A\u8BDD');
@@ -388,15 +422,32 @@ document.getElementById('clearLogButton').onclick = () => {
   log('\u65E5\u5FD7\u5DF2\u6E05\u7A7A');
 };
 
+// 分配失败：隐藏主界面，显示错误页，不再自动重连。
+function showAssignFailed(reason) {
+  const page = document.querySelector('.page');
+  const errorPage = document.getElementById('assignErrorPage');
+  if (page) page.style.display = 'none';
+  if (errorPage) {
+    errorPage.style.display = '';
+    const detail = document.getElementById('assignErrorDetail');
+    if (detail) detail.textContent = reason || '未知原因';
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (e) { /* ignore */ }
+  }
+  // 停止后续重连
+  reconnectAttempts = -1;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
 // ========== 启动：先加载运行时配置（config.json），再连接信令 ==========
 async function init() {
   await loadRuntimeConfig();
 
   document.getElementById('wsUrlText').textContent = wsUrl;
-  document.getElementById('selfIdText').textContent = selfId;
-  document.getElementById('peerIdText').textContent = peerId;
-  document.getElementById('peerLabel').textContent = peerId;
-  document.getElementById('selfLabel').textContent = selfId;
 
   setStatus(wsStatusEl, wsDot, 'connecting');
   setStatus(pcStatusEl, pcDot, 'new');

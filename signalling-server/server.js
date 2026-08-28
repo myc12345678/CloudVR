@@ -25,12 +25,20 @@ try {
   console.log('未找到或无法解析 config.json，使用默认值:', e.message);
 }
 
-const signallingCfg = globalConfig.signalling || {};
+// 注意：键名与 config.json 一致为 signalling_server（历史代码曾误用 signalling，
+// 因默认值恰好对齐未暴露；P3 修正）。环境变量优先级仍高于 config.json。
+const signallingCfg = globalConfig.signalling_server || {};
 const PORT = Number(process.env.PORT || signallingCfg.port || 8443);
 const HOST = process.env.HOST || signallingCfg.host || '0.0.0.0';
-const CERT_DIR = process.env.CERT_DIR || path.join(__dirname, 'certs');
-const TLS_KEY_PATH = process.env.TLS_KEY_PATH || path.join(CERT_DIR, 'dev-key.pem');
-const TLS_CERT_PATH = process.env.TLS_CERT_PATH || path.join(CERT_DIR, 'dev-cert.pem');
+const TLS_KEY_PATH = process.env.TLS_KEY_PATH || signallingCfg.tls_key_path ||
+    path.join(__dirname, 'certs', 'dev-key.pem');
+const TLS_CERT_PATH = process.env.TLS_CERT_PATH || signallingCfg.tls_cert_path ||
+    path.join(__dirname, 'certs', 'dev-cert.pem');
+
+// 并发上限（P3）：来自 config.json 的 concurrency.max_users，用于校验客户端 id。
+// 缺省时不限制（fail-open），但正式部署应在 config.json 中显式配置。
+const concurrencyCfg = globalConfig.concurrency || {};
+const MAX_USERS = Number(concurrencyCfg.max_users || 0);
 
 // 保存：id -> connection
 const clients = new Map();
@@ -201,8 +209,51 @@ function sendTextFrame(state, text) {
 function handleTextMessage(state, msg) {
   msg = msg.trim();
 
+  // 自动分配（P4 前置）：浏览器连接后发 ASSIGN，服务器分配一个未被 viewer_<k>
+  // 占用的槽位。全满则拒绝，浏览器据此显示错误页。
+  if (msg === 'ASSIGN') {
+    if (MAX_USERS <= 0) {
+      console.log('ASSIGN failed: max_users not configured');
+      sendTextFrame(state, 'ASSIGN_FAILED not_configured');
+      state.socket.destroy();
+      return;
+    }
+    let assigned = -1;
+    for (let k = 0; k < MAX_USERS; k++) {
+      if (!clients.has(`viewer_${k}`)) {
+        assigned = k;
+        break;
+      }
+    }
+    if (assigned < 0) {
+      console.log(`ASSIGN failed: all ${MAX_USERS} slots busy`);
+      sendTextFrame(state, `ASSIGN_FAILED full ${MAX_USERS}`);
+      state.socket.destroy();
+      return;
+    }
+    const id = `viewer_${assigned}`;
+    state.id = id;
+    clients.set(id, state);
+    console.log(`ASSIGN -> id=${id}`);
+    sendTextFrame(state, `ASSIGNED ${assigned}`);
+    return;
+  }
+
   if (msg.startsWith('HELLO ')) {
     const id = msg.substring('HELLO '.length).trim();
+
+    // 并发校验（P3）：id 形如 viewer_<u> / sender_<u>，解析尾部索引 u，
+    // 若 u >= max_users 则拒绝连接，防止超过 config.json 限定的并发上限。
+    if (MAX_USERS > 0) {
+      const m = /^(?:viewer|sender)_(\d+)$/.exec(id);
+      if (m && Number(m[1]) >= MAX_USERS) {
+        console.log(`Reject HELLO id=${id}: index >= max_users=${MAX_USERS}`);
+        sendTextFrame(state, 'REJECT max_users');
+        state.socket.destroy();
+        return;
+      }
+    }
+
     state.id = id;
     clients.set(id, state);
     console.log(`Client HELLO: id=${id}`);

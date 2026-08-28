@@ -9,6 +9,15 @@
 </head>
 
 <body>
+  <div id="assignErrorPage" class="assign-error" style="display:none;">
+    <div class="assign-error-card">
+      <div class="assign-error-title">无法接入会话</div>
+      <p class="assign-error-msg">当前所有用户槽位已满，暂时无法为你分配会话。</p>
+      <p class="assign-error-detail" id="assignErrorDetail"></p>
+      <p class="assign-error-hint">请稍后刷新页面重试，或联系管理员扩容。</p>
+    </div>
+  </div>
+
   <div class="page">
     <section class="hero">
       <div>
@@ -83,6 +92,7 @@
           </div>
 
           <div class="facts">
+            <div class="fact"><span>用户索引</span><strong id="userIndexText"></strong></div>
             <div class="fact"><span>信令地址</span><strong id="wsUrlText"></strong></div>
             <div class="fact"><span>本地 ID</span><strong id="selfIdText"></strong></div>
             <div class="fact"><span>目标 Peer</span><strong id="peerIdText"></strong></div>

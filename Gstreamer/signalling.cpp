@@ -216,7 +216,11 @@ static void handle_input_message(int u, const std::string &raw_input_json) {
 
   std::string inner =
       raw_input_json.substr(inner_start, inner_end - inner_start);
-  send_to_godot(u, inner.c_str(), inner.size());
+
+  // 输入归属：由用户 u 映射到 GPU 与玩家索引，转发给对应 GPU 的 TCP 通道。
+  const int gpu = session(u).gpu;
+  const int player = session(u).local_player;
+  send_to_godot(gpu, player, inner.c_str(), inner.size());
 }
 
 static void handle_json_message(int u, const gchar *text) {
@@ -249,7 +253,9 @@ static void handle_json_message(int u, const gchar *text) {
       JsonGenerator *gen = json_generator_new();
       json_generator_set_root(gen, input_root);
       gchar *text = json_generator_to_data(gen, nullptr);
-      send_to_godot(u, text, strlen(text));
+      const int gpu = session(u).gpu;
+      const int player = session(u).local_player;
+      send_to_godot(gpu, player, text, strlen(text));
       g_free(text);
       g_object_unref(gen);
       json_node_free(input_root);

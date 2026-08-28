@@ -69,37 +69,46 @@ int main(int argc, char *argv[]) {
             << " players_per_gpu=" << g_config.players_per_gpu
             << " max_users=" << g_config.max_users << std::endl;
 
-  // ---- P2：初始化每个用户的会话状态 ----
+  // ---- P3：初始化每个用户的会话状态（模板展开值）----
   // 派生 gpu(u) = u / players_per_gpu, local_player(u) = u % players_per_gpu。
-  // P2 阶段保持旧键/旧路径，行为与单用户一致；P3 起切换为模板展开值。
+  // P3 起全部切换为模板展开值：shm_<u>、sender_<u>、viewer_<u>。
   for (int u = 0; u < g_config.max_users; ++u) {
     UserSession &s = session(u);
     s.index = u;
     s.gpu = u / g_config.players_per_gpu;
     s.local_player = u % g_config.players_per_gpu;
-    s.sender_id = g_config.self_id;   // P2 用旧键
-    s.viewer_id = g_config.peer_id;   // P2 用旧键
-    s.shm_path = g_config.shm_path;   // P2 用旧路径
-    s.tcp_port = g_config.godot_tcp_port; // P2 用旧键
+    s.sender_id = expand_index_template(g_config.sender_id_template, u);
+    s.viewer_id = expand_index_template(g_config.viewer_id_template, u);
+    s.shm_path = expand_index_template(g_config.shm_path_template, u);
   }
 
-  // ---- 逐用户启动管线 / TCP / shm / 信令 ----
+  // ---- 初始化每 GPU 的 TCP 控制通道 ----
+  for (int g = 0; g < g_config.gpu_count; ++g) {
+    gpu_tcp(g).tcp_port = g_config.tcp_port_base + g;
+  }
+
+  // ---- 逐用户启动管线 / shm / 信令 ----
   for (int u = 0; u < g_config.max_users; ++u) {
     start_pipeline(u);
-    start_godot_tcp_server(u); // TCP 输入控制指令（保留）
     start_shm_frame_reader(u); // 共享内存视频帧（零拷贝，优选）
     // 连接 signalling server (WSS)。
     // 注意：即使信令服务器尚未启动 / 中途断开，sender 也不会退出，
     // 而是持续在后台重连（见 signalling.cpp）。因此这里不再做硬性失败退出。
     connect_to_signalling_server(u);
   }
+  // TCP 输入控制通道按 GPU 启动（每 GPU 一条，供该 GPU 内所有玩家复用）。
+  for (int g = 0; g < g_config.gpu_count; ++g) {
+    start_godot_tcp_server(g);
+  }
 
   g_main_loop_run(loop);
 
-  // ---- 逐用户清理 ----
+  // ---- 逐 GPU / 逐用户清理 ----
+  for (int g = 0; g < g_config.gpu_count; ++g) {
+    stop_godot_tcp_server(g);
+  }
   for (int u = 0; u < g_config.max_users; ++u) {
     stop_shm_frame_reader(u);
-    stop_godot_tcp_server(u);
     if (session(u).ws_conn)
       g_object_unref(session(u).ws_conn);
     stop_pipeline(u);

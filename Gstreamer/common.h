@@ -35,6 +35,14 @@ extern std::array<UserSession, MAX_USERS_HARD> g_sessions;
 // 按用户索引 u 取会话引用（u 已在 main.cpp 启动校验保证 < max_users）。
 UserSession &session(int u);
 
+// ======================== 每 GPU 的 TCP 控制通道 ========================
+// 固定上限 MAX_USERS_HARD 的 per-GPU TCP 状态数组（GpuTcpState 含 thread/mutex，
+// 不可拷贝/移动）。运行时只使用前 gpu_count 个。
+extern std::array<GpuTcpState, MAX_USERS_HARD> g_gpu_tcp;
+
+// 按 GPU 索引 g 取 TCP 状态引用（g 已在 main.cpp 启动校验保证 < gpu_count）。
+GpuTcpState &gpu_tcp(int g);
+
 // 单调时钟毫秒值（用于对重连 / 自愈操作限频）
 uint64_t now_ms();
 

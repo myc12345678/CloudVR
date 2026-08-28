@@ -9,13 +9,19 @@ var GSTREAMER_PORT := 9002
 var TARGET_WIDTH := 1920
 var TARGET_HEIGHT := 1080
 var TARGET_FPS := 30.0
-var SHM_PATH := "/dev/shm/godot_webrtc_frame"
+var SHM_PATH_TEMPLATE := "/dev/shm/godot_webrtc_frame_{index}"
 var SHM_HEADER_SIZE := 16
 var SHM_FRAME_MAX_SIZE := 1920 * 1080 * 3 # RGB8, 启动时由 config.json 重新计算
+var PLAYERS_PER_GPU := 1                    # 每 GPU 的玩家数（P3 起读 topology.players_per_gpu）
+var GPU_INDEX := 0                          # 本实例的 GPU 索引（P4 起由启动参数传入）
 
-# 用 SubViewport 独立渲染并取帧：与主窗口解耦，窗口最小化/失焦时仍持续渲染
-# （也避开 get_image() 真实帧 get_data() 慢的问题）
-var _sub_viewport: SubViewport
+# 用 SubViewport 独立渲染每个玩家视角：与主窗口解耦，窗口最小化/失焦时仍持续渲染
+# （也避开 get_image() 真实帧 get_data() 慢的问题）。
+# P3 起多玩家：每个玩家一个 SubViewport（own_world_3d=false 共享同一世界），
+# 各含一个 Player + Camera3D，各自写入独立 shm。
+var _sub_viewports: Array = []
+var _players: Array = []
+var _player_inputs: Array = []
 
 var tcp := StreamPeerTCP.new()
 var frame_interval := 1.0 / TARGET_FPS
@@ -24,9 +30,9 @@ var connected := false
 var _reconnect_timer := 2.0
 var _shm_reopen_timer := 1.0
 
-# 共享内存文件句柄
-var shm_file: FileAccess = null
-var shm_write_counter: int = 0
+# 共享内存文件句柄（每玩家一个）
+var shm_files: Array = []
+var shm_write_counters: Array = []
 
 # TCP 消息解析状态机：防止部分读取导致数据损坏
 var _read_state: int = 0 # 0=等待读取长度头, 1=等待读取payload
@@ -42,24 +48,32 @@ func _ready() -> void:
 	OS.low_processor_usage_mode = false
 	# 关闭 vsync，避免主循环被显示器刷新率限制，方便跑满目标帧率
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
-	# 用 SubViewport 独立渲染世界：与主窗口解耦，窗口最小化/失焦时仍持续渲染，
-	# 且读取其纹理可避开主视口 get_image() 真实帧 get_data() 慢的问题。
-	_setup_sub_viewport()
+	# P3：为每个玩家建立一个 SubViewport（共享世界），各渲染各自视角。
+	_setup_players()
 	_attempt_connect()
 	_open_shm()
 
 
-func _setup_sub_viewport() -> void:
-	_sub_viewport = SubViewport.new()
-	_sub_viewport.size = Vector2i(TARGET_WIDTH, TARGET_HEIGHT)
-	_sub_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
-	add_child(_sub_viewport)
-	# 把场景世界（Player、相机、网格、环境等）从主视口移入 SubViewport，
-	# 使 Camera3D 渲染到该离屏 render target。
-	for child in get_children():
-		if child == _sub_viewport:
-			continue
-		child.reparent(_sub_viewport)
+func _setup_players() -> void:
+	var player_scene := preload("res://player.tscn")
+	for k in range(PLAYERS_PER_GPU):
+		var sv := SubViewport.new()
+		sv.size = Vector2i(TARGET_WIDTH, TARGET_HEIGHT)
+		# own_world_3d = false（默认）：共享父节点的 World3D，所有玩家在同一世界
+		sv.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+		add_child(sv)
+		_sub_viewports.append(sv)
+
+		var player := player_scene.instantiate()
+		# 出生点横向错开，避免多个玩家完全重叠
+		player.position = Vector3(2.96 + k * 3.0, 1.31, 0.0)
+		sv.add_child(player)
+
+		var input := NetworkInputRouter.register(k)
+		player.player_input = input
+
+		_players.append(player)
+		_player_inputs.append(input)
 
 
 # 从项目根目录的 config.json 加载所有运行参数
@@ -101,25 +115,46 @@ func _load_config() -> void:
 	if cfg.has("godot"):
 		var g = cfg["godot"]
 		if g.has("gstreamer_host"): GSTREAMER_HOST = str(g["gstreamer_host"])
-		if g.has("tcp_port"): GSTREAMER_PORT = int(g["tcp_port"])
+		if g.has("tcp_port_base"): GSTREAMER_PORT = int(g["tcp_port_base"])
+		elif g.has("tcp_port"): GSTREAMER_PORT = int(g["tcp_port"])
 
-	# 共享内存路径
+	# 拓扑：每 GPU 玩家数（P3 起使用）
+	if cfg.has("topology"):
+		var t = cfg["topology"]
+		if t.has("players_per_gpu"): PLAYERS_PER_GPU = int(t["players_per_gpu"])
+
+	# 共享内存路径模板（P3 起使用）
 	if cfg.has("shm"):
 		var s = cfg["shm"]
-		if s.has("path"): SHM_PATH = str(s["path"])
+		if s.has("path_template"): SHM_PATH_TEMPLATE = str(s["path_template"])
 
 	# 重新计算帧缓冲区大小（RGB8 = 每像素 3 字节）
 	SHM_FRAME_MAX_SIZE = TARGET_WIDTH * TARGET_HEIGHT * 3
 	frame_interval = 1.0 / TARGET_FPS
 
-	print("配置已从 config.json 加载: %dx%d@%dfps, SHM=%s" %
-		[TARGET_WIDTH, TARGET_HEIGHT, TARGET_FPS, SHM_PATH])
+	print("配置已从 config.json 加载: %dx%d@%dfps, players_per_gpu=%d, SHM模板=%s" %
+		[TARGET_WIDTH, TARGET_HEIGHT, TARGET_FPS, PLAYERS_PER_GPU, SHM_PATH_TEMPLATE])
+
+
+# 展开 shm 路径模板中的 {index} 占位符（与 C++ 端 expand_index_template 一致）。
+func _shm_path_for(k: int) -> String:
+	return SHM_PATH_TEMPLATE.replace("{index}", str(k))
 
 
 func _open_shm() -> void:
+	# 为每个玩家创建/打开独立 shm 文件
+	shm_files.clear()
+	shm_write_counters.clear()
+	for k in range(PLAYERS_PER_GPU):
+		shm_files.append(null)
+		shm_write_counters.append(0)
+		_open_shm_for(k)
+
+
+func _open_shm_for(k: int) -> void:
 	# 创建或打开 /dev/shm 中的共享内存文件
 	# /dev/shm 是 tmpfs，所有读写均在 RAM 中进行
-	var path := SHM_PATH
+	var path := _shm_path_for(k)
 	var total_size := SHM_HEADER_SIZE + SHM_FRAME_MAX_SIZE
 
 	# 检查现有文件大小是否匹配（防止分辨率变更后新旧进程不匹配）
@@ -130,7 +165,7 @@ func _open_shm() -> void:
 			var existing_len := existing.get_length()
 			existing.close()
 			if existing_len != total_size:
-				print("SHM 文件大小不匹配 (旧=%d, 新=%d)，正在重建…" % [existing_len, total_size])
+				print("SHM[%d] 文件大小不匹配 (旧=%d, 新=%d)，正在重建…" % [k, existing_len, total_size])
 				DirAccess.remove_absolute(path)
 				var err := FileAccess.get_open_error()
 				if err != OK:
@@ -150,23 +185,25 @@ func _open_shm() -> void:
 			push_warning("无法创建共享内存文件: ", path)
 			return
 
-	shm_file = FileAccess.open(path, FileAccess.READ_WRITE)
+	var shm_file := FileAccess.open(path, FileAccess.READ_WRITE)
 	if shm_file:
 		print("共享内存已打开: ", path, " (零拷贝帧传输)")
+		shm_files[k] = shm_file
 	else:
 		push_warning("无法打开共享内存: ", path)
 
 
-func _ensure_shm_valid() -> void:
+func _ensure_shm_valid(k: int) -> void:
 	# 共享内存文件被外部删除/重建时，自动重新打开，避免写入已 unlink 的陈旧 inode。
+	var shm_file: FileAccess = shm_files[k]
 	if shm_file == null:
-		_open_shm()
+		_open_shm_for(k)
 		return
-	if not FileAccess.file_exists(SHM_PATH):
-		print("SHM 文件路径不存在，正在重新打开…")
+	if not FileAccess.file_exists(_shm_path_for(k)):
+		print("SHM[%d] 文件路径不存在，正在重新打开…" % k)
 		shm_file.close()
-		shm_file = null
-		_open_shm()
+		shm_files[k] = null
+		_open_shm_for(k)
 
 
 func _process(delta: float) -> void:
@@ -176,7 +213,8 @@ func _process(delta: float) -> void:
 	_shm_reopen_timer -= delta
 	if _shm_reopen_timer <= 0.0:
 		_shm_reopen_timer = 1.0
-		_ensure_shm_valid()
+		for k in range(PLAYERS_PER_GPU):
+			_ensure_shm_valid(k)
 
 	if not connected:
 		_reconnect_timer -= delta
@@ -203,9 +241,9 @@ func _physics_process(_delta: float) -> void:
 func _exit_tree() -> void:
 	if tcp.get_status() != StreamPeerTCP.STATUS_NONE:
 		tcp.disconnect_from_host()
-	if shm_file:
-		shm_file.close()
-		shm_file = null
+	for shm_file in shm_files:
+		if shm_file:
+			shm_file.close()
 
 
 func _attempt_connect() -> void:
@@ -263,8 +301,14 @@ func _update_connection_state() -> void:
 #   5. ready = 1
 
 func send_frame() -> void:
+	for k in range(PLAYERS_PER_GPU):
+		_send_frame_for(k)
+
+
+func _send_frame_for(k: int) -> void:
+	var sv: SubViewport = _sub_viewports[k]
 	# 捕获 SubViewport 的纹理（离屏 render target，与主窗口解耦）
-	var tex := _sub_viewport.get_texture()
+	var tex := sv.get_texture()
 	if tex == null:
 		return
 
@@ -285,11 +329,12 @@ func send_frame() -> void:
 		return
 
 	# 通过共享内存发送原始 RGB 帧（零拷贝，零编解码）
+	var shm_file: FileAccess = shm_files[k]
 	if shm_file:
-		_send_frame_via_shm(data)
+		_send_frame_via_shm(k, shm_file, data)
 
 
-func _send_frame_via_shm(frame_data: PackedByteArray) -> void:
+func _send_frame_via_shm(k: int, shm_file: FileAccess, frame_data: PackedByteArray) -> void:
 	var sz := frame_data.size()
 	if sz > SHM_FRAME_MAX_SIZE:
 		push_warning("帧数据过大: %d > %d" % [sz, SHM_FRAME_MAX_SIZE])
@@ -305,10 +350,10 @@ func _send_frame_via_shm(frame_data: PackedByteArray) -> void:
 
 	# 3. 一次性写入完整头信息（counter + frame_size + ready=1）到 offset 0
 	#    减少 seek/store 系统调用：原来 5 次 seek + 3 次 store → 1 次 seek + 1 次 store
-	shm_write_counter += 1
+	shm_write_counters[k] += 1
 	var header := PackedByteArray()
 	header.resize(16)
-	header.encode_u64(0, shm_write_counter) # offset 0:  write_counter
+	header.encode_u64(0, shm_write_counters[k]) # offset 0:  write_counter
 	header.encode_u32(8, sz) # offset 8:  frame_size
 	header.encode_u8(12, 1) # offset 12: ready = 1
 	# offset 13-15: padding (默认为 0)
@@ -375,6 +420,7 @@ func _handle_input_command(json_str: String) -> void:
 	if data == null or not data is Dictionary:
 		return
 
-	# 交给网络输入路由器翻译成逻辑动作并注入 Input 单例
-	NetworkInputRouter.handle_remote_input(
-		str(data.get("type", "")), data)
+	# P3：消息体带 "player" 字段，按玩家索引分发到对应 PlayerInput
+	var player := int(data.get("player", 0))
+	var type_str := str(data.get("type", ""))
+	NetworkInputRouter.dispatch(player, type_str, data)
