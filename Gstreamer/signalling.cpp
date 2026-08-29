@@ -266,8 +266,12 @@ static void handle_json_message(int u, const gchar *text) {
 
   if (json_object_has_member(obj, "reset")) {
     g_print("Received reset, triggering renegotiation\n");
+    // 与 pipeline.cpp::maybe_reset_pipeline 相同的顺序：先停读帧线程再重建管线，
+    // 防止 shm 读线程在 stop_pipeline 释放 appsrc 期间持旧指针访问（use-after-free）。
+    stop_shm_frame_reader(u);
     stop_pipeline(u);
     start_pipeline(u);
+    start_shm_frame_reader(u);
     g_object_unref(parser);
     return;
   }
@@ -301,8 +305,11 @@ static void on_ws_message(SoupWebsocketConnection *,
       s.session_started = true;
       // 握手完成后强制重新协商，保证无论哪一端先启动都能重新发出 offer，
       // 覆盖“先开 sender 后开浏览器 / sender 单独重连”等所有时序。
+      // 同样遵循“先停 shm 读线程 → 重建管线 → 重启 shm 读线程”的顺序，消除竞态。
+      stop_shm_frame_reader(u);
       stop_pipeline(u);
       start_pipeline(u);
+      start_shm_frame_reader(u);
     }
     return;
   }

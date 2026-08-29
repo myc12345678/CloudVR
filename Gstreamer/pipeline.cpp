@@ -6,6 +6,7 @@
 #include "common.h"
 #include "config.h"
 #include "signalling.h"
+#include "tcp_server.h"
 
 void push_raw_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
   UserSession &s = session(u);
@@ -67,8 +68,12 @@ static void maybe_reset_pipeline(int u) {
   s.pipeline_error_resets++;
   std::cerr << "Resetting pipeline (attempt " << s.pipeline_error_resets << "/"
             << MAX_PIPELINE_RESETS << ")..." << std::endl;
+  // 先停读帧线程，避免其与 stop_pipeline 释放 appsrc 发生数据竞争（use-after-free）。
+  // 恢复顺序：shm 线程 → pipeline → pipeline → shm 线程。
+  stop_shm_frame_reader(u);
   stop_pipeline(u);
   start_pipeline(u);
+  start_shm_frame_reader(u);
 }
 
 static gboolean bus_call(GstBus * /*bus*/, GstMessage *msg, gpointer data) {
