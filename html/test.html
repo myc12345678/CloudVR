@@ -19,96 +19,114 @@
   </div>
 
   <div class="page">
-    <section class="hero">
-      <div>
-        <div class="badge">Godot → GStreamer → WebRTC → Browser</div>
-        <h1>实时串流预览面板</h1>
-        <p>
-          这个页面用于接收来自 GStreamer 的 WebRTC 视频流，展示 Godot 摄像机画面。
-          我保留了原有的信令与调试能力，同时把播放器、状态和日志整合成了更适合演示的界面。
-        </p>
-      </div>
-      <div class="badge" id="heroStatus">准备连接信令服务</div>
-    </section>
-
-    <section class="layout">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>远端视频</h2>
-          <div class="pill" id="streamBadge">等待视频轨…</div>
-        </div>
-        <div class="panel-body">
+    <main class="app-main">
+      <section class="viewer">
+        <div class="video-panel">
           <div class="video-shell">
             <video id="remoteVideo" autoplay playsinline muted></video>
+            <div class="video-idle" id="videoIdle">
+              <svg class="spinner" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.6" /></svg>
+              <span>等待视频流…</span>
+            </div>
             <div class="video-overlay">
-              <div class="video-meta">
-                <div class="pill">Peer: <strong id="peerLabel">cpp_sender</strong></div>
-                <div class="pill">Viewer: <strong id="selfLabel">browser</strong></div>
+              <div class="video-controls">
+                <button class="primary" id="playButton" title="浏览器自动播放策略可能阻止自动播放，可手动点击播放">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
+                  <span>开始播放</span>
+                </button>
+                <button class="secondary" id="fullscreenButton">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3" /><path d="M16 3h3a2 2 0 0 1 2 2v3" /><path d="M8 21H5a2 2 0 0 1-2-2v-3" /><path d="M16 21h3a2 2 0 0 0 2-2v-3" /></svg>
+                  <span id="fullscreenLabel">全屏</span>
+                </button>
+                <button class="secondary" id="clearLogButton">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /></svg>
+                  <span>清空日志</span>
+                </button>
               </div>
-              <div class="pill" id="resolutionBadge">分辨率: --</div>
+              <div class="video-bottom">
+                <div class="video-meta">
+                  <div class="pill">Peer: <strong id="peerLabel">cpp_sender</strong></div>
+                  <div class="pill">Viewer: <strong id="selfLabel">browser</strong></div>
+                </div>
+                <div class="pill" id="resolutionBadge">分辨率: --</div>
+              </div>
             </div>
-          </div>
-
-          <div class="controls">
-            <button class="primary" id="playButton">开始播放</button>
-            <button class="secondary" id="clearLogButton">清空日志</button>
-          </div>
-
-          <div class="hint">
-            如果浏览器因为自动播放策略未立即播放，可以点击“开始播放”。
-            页面右侧会同步显示 WebSocket、ICE、PeerConnection 和视频状态，方便你现场排查。
           </div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-head">
-          <h3>连接状态</h3>
-          <div class="pill" id="overallBadge">初始化中</div>
+        <div class="status-bar">
+          <div class="status-row status-latency-row">
+            <div class="status-item latency-item">
+              <span class="status-name">延迟</span>
+              <span class="status-value latency-value" id="latencyValue">-- ms</span>
+              <span class="latency-detail" id="latencyDetail"></span>
+            </div>
+          </div>
+          <div class="status-row status-info-row">
+            <div class="status-item status-pill">
+              <span class="status-name">总状态</span>
+              <span class="status-value" id="overallBadge">初始化中</span>
+            </div>
+            <div class="status-item status-pill">
+              <span class="status-name">视频流</span>
+              <span class="status-value" id="streamBadge">等待视频轨…</span>
+            </div>
+            <div class="status-item">
+              <span class="dot" id="wsDot"></span>
+              <span class="status-name">WS</span>
+              <span class="status-value" id="wsStatus">connecting</span>
+            </div>
+            <div class="status-item">
+              <span class="dot" id="pcDot"></span>
+              <span class="status-name">PC</span>
+              <span class="status-value" id="pcStatus">new</span>
+            </div>
+            <div class="status-item">
+              <span class="dot" id="iceDot"></span>
+              <span class="status-name">ICE</span>
+              <span class="status-value" id="iceStatus">new</span>
+            </div>
+            <div class="status-item">
+              <span class="dot" id="videoDot"></span>
+              <span class="status-name">视频</span>
+              <span class="status-value" id="videoStatus">idle</span>
+            </div>
+            <div class="status-spacer"></div>
+            <div class="status-item">
+              <span class="status-name">用户</span>
+              <span class="status-value" id="userIndexText">--</span>
+            </div>
+            <div class="status-item">
+              <span class="status-name">Peer</span>
+              <span class="status-value" id="peerIdText">--</span>
+            </div>
+            <div class="status-item">
+              <span class="status-name">本机</span>
+              <span class="status-value" id="selfIdText">--</span>
+            </div>
+            <div class="status-item status-url" title="信令地址">
+              <span class="status-name">信令</span>
+              <span class="status-value" id="wsUrlText"></span>
+            </div>
+          </div>
         </div>
-        <div class="panel-body">
-          <div class="status-grid">
-            <div class="status-card">
-              <div class="status-label">WebSocket</div>
-              <div class="status-value"><span class="dot" id="wsDot"></span><span id="wsStatus">connecting</span></div>
-            </div>
-            <div class="status-card">
-              <div class="status-label">PeerConnection</div>
-              <div class="status-value"><span class="dot" id="pcDot"></span><span id="pcStatus">new</span></div>
-            </div>
-            <div class="status-card">
-              <div class="status-label">ICE</div>
-              <div class="status-value"><span class="dot" id="iceDot"></span><span id="iceStatus">new</span></div>
-            </div>
-            <div class="status-card">
-              <div class="status-label">Video</div>
-              <div class="status-value"><span class="dot" id="videoDot"></span><span id="videoStatus">idle</span></div>
-            </div>
-            <div class="status-card latency-card">
-              <div class="status-label">延迟</div>
-              <div class="status-value latency-value" id="latencyValue">-- ms</div>
-              <div class="latency-detail" id="latencyDetail"></div>
-            </div>
-          </div>
+      </section>
 
-          <div class="facts">
-            <div class="fact"><span>用户索引</span><strong id="userIndexText"></strong></div>
-            <div class="fact"><span>信令地址</span><strong id="wsUrlText"></strong></div>
-            <div class="fact"><span>本地 ID</span><strong id="selfIdText"></strong></div>
-            <div class="fact"><span>目标 Peer</span><strong id="peerIdText"></strong></div>
-          </div>
-
-          <div class="panel-head" style="padding: 18px 0 0; border-bottom: 0; background: transparent;">
-            <h3>运行日志</h3>
-          </div>
+      <aside class="logs-panel collapsed" id="logsPanel">
+        <button class="logs-handle" id="logsToggle" aria-expanded="false">
+          <span class="logs-handle-label">运行日志</span>
+          <span class="logs-count" id="logCount">0</span>
+          <span class="logs-arrow" id="logsArrow">‹</span>
+          <span class="logs-badge" id="logCountBadge">0</span>
+        </button>
+        <div class="logs-body" id="logsBody">
           <div class="log-box" id="logBox"></div>
-
           <div class="footer-note">
             日志会同时输出到浏览器控制台和页面内面板，便于演示与调试。
           </div>
         </div>
-      </div>
-    </section>
+      </aside>
+    </main>
   </div>
 
   <script src="script.js"></script>

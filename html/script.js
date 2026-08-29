@@ -25,6 +25,8 @@ const iceDot = document.getElementById('iceDot');
 const videoDot = document.getElementById('videoDot');
 
 const video = document.getElementById('remoteVideo');
+const videoIdle = document.getElementById('videoIdle');
+const videoControls = document.querySelector('.video-controls');
 
 async function loadRuntimeConfig() {
   try {
@@ -64,6 +66,19 @@ function stringifyArg(arg) {
   }
 }
 
+function updateLogCount() {
+  const n = logBox.children.length;
+  const el = document.getElementById('logCount');
+  if (el) el.textContent = `${n} 条日志`;
+  const badge = document.getElementById('logCountBadge');
+  if (badge) badge.textContent = n;
+}
+
+function setVideoIdle(visible) {
+  if (!videoIdle) return;
+  videoIdle.classList.toggle('hide', !visible);
+}
+
 function log(...args) {
   console.log(...args);
   const line = document.createElement('div');
@@ -76,6 +91,7 @@ function log(...args) {
     logBox.removeChild(logBox.firstChild);
   }
   logBox.scrollTop = logBox.scrollHeight;
+  updateLogCount();
 }
 
 function setStatus(textEl, dotEl, value) {
@@ -93,8 +109,8 @@ function setStatus(textEl, dotEl, value) {
 }
 
 function updateHero(text) {
-  heroStatus.textContent = text;
   overallBadge.textContent = text;
+  if (heroStatus) heroStatus.textContent = text;
 }
 
 // ========== WebSocket 自动重连（指数退避） ==========
@@ -129,6 +145,7 @@ function resetWebRTC() {
   setStatus(iceStatusEl, iceDot, 'new');
   setStatus(videoStatusEl, videoDot, 'idle');
   streamBadge.textContent = '待建立连接';
+  setVideoIdle(true);
 }
 
 function connectWebSocket() {
@@ -393,6 +410,7 @@ video.onplaying = () => {
   streamBadge.textContent = '\u89C6\u9891\u64AD\u653E\u4E2D';
   updateHero('\u89C6\u9891\u64AD\u653E\u4E2D');
   log('video playing', video.videoWidth, video.videoHeight);
+  setVideoIdle(false);
   startLatencyPolling();
 };
 
@@ -417,10 +435,93 @@ document.getElementById('playButton').onclick = () => {
   }
 };
 
+// ========== 视频全屏 ==========
+const videoShell = document.querySelector('.video-shell');
+const fullscreenButton = document.getElementById('fullscreenButton');
+const fullscreenLabel = document.getElementById('fullscreenLabel');
+
+function toggleFullscreen() {
+  if (!videoShell) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen()
+      .then(() => log('退出全屏'))
+      .catch(e => log('exit fullscreen error:', e.name || e, e.message || ''));
+  } else {
+    videoShell.requestFullscreen()
+      .then(() => log('进入全屏'))
+      .catch(e => log('request fullscreen error:', e.name || e, e.message || ''));
+  }
+}
+
+if (fullscreenButton) {
+  fullscreenButton.addEventListener('click', toggleFullscreen);
+}
+
+if (document.addEventListener) {
+  document.addEventListener('fullscreenchange', () => {
+    if (fullscreenLabel) {
+      fullscreenLabel.textContent = document.fullscreenElement ? '退出全屏' : '全屏';
+    }
+  });
+}
+
+// 双击视频区域切换全屏
+if (video) {
+  video.addEventListener('dblclick', toggleFullscreen);
+}
+
+// ========== 视频浮层按钮自动隐藏 ==========
+let hideControlsTimer = null;
+function showVideoControls() {
+  if (!videoControls) return;
+  videoControls.classList.remove('hide');
+  clearTimeout(hideControlsTimer);
+  hideControlsTimer = setTimeout(() => videoControls.classList.add('hide'), 2500);
+}
+
+if (videoShell && videoControls) {
+  videoShell.addEventListener('mousemove', showVideoControls);
+  videoShell.addEventListener('mouseenter', showVideoControls);
+  videoShell.addEventListener('touchstart', showVideoControls, { passive: true });
+  videoShell.addEventListener('mouseleave', () => {
+    clearTimeout(hideControlsTimer);
+    hideControlsTimer = setTimeout(() => videoControls.classList.add('hide'), 800);
+  });
+  showVideoControls();
+}
+
 document.getElementById('clearLogButton').onclick = () => {
   logBox.innerHTML = '';
   log('\u65E5\u5FD7\u5DF2\u6E05\u7A7A');
 };
+
+// ========== 日志侧边栏折叠 / 展开 ==========
+const logsPanel = document.querySelector('.logs-panel');
+const logsToggle = document.getElementById('logsToggle');
+const logsArrow = document.getElementById('logsArrow');
+
+function setLogsCollapsed(collapsed) {
+  if (!logsPanel) return;
+  logsPanel.classList.toggle('collapsed', collapsed);
+  if (logsToggle) logsToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  if (logsArrow) logsArrow.textContent = collapsed ? '\u2039' : '\u203A';
+  if (!collapsed && logBox) logBox.scrollTop = logBox.scrollHeight;
+}
+
+function toggleLogs() {
+  if (!logsPanel) return;
+  setLogsCollapsed(!logsPanel.classList.contains('collapsed'));
+}
+
+if (logsToggle) {
+  logsToggle.addEventListener('click', toggleLogs);
+  logsToggle.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggleLogs();
+    }
+  });
+}
 
 // 分配失败：隐藏主界面，显示错误页，不再自动重连。
 function showAssignFailed(reason) {
