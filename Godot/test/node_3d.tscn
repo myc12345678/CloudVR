@@ -48,6 +48,8 @@ points = PackedVector3Array(-0.49943367, -0.023884177, 0, -0.49708706, -0.023884
 script = ExtResource("1_a202f")
 
 [node name="StaticBody3D" type="StaticBody3D" parent="." unique_id=1893886616]
+collision_layer = 1
+collision_mask = 3
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="StaticBody3D" unique_id=1201812368]
 mesh = SubResource("PlaneMesh_4xowi")
@@ -57,6 +59,8 @@ shape = SubResource("ConcavePolygonShape3D_a202f")
 
 [node name="RigidBody3D" type="RigidBody3D" parent="." unique_id=650219814]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.0941739, 2.624774, 0.9549978)
+collision_layer = 1
+collision_mask = 3
 
 [node name="MeshInstance3D2" type="MeshInstance3D" parent="RigidBody3D" unique_id=1311138309]
 mesh = SubResource("BoxMesh_noarx")
@@ -73,6 +77,8 @@ transform = Transform3D(0.97673595, 0.09391256, -0.19278827, 0.04800997, 0.78042
 light_energy = 1.5
 
 [node name="StaticBody3D2" type="StaticBody3D" parent="." unique_id=404171037]
+collision_layer = 1
+collision_mask = 3
 
 [node name="PlaneCollision" type="CollisionShape3D" parent="StaticBody3D2" unique_id=1875250426]
 transform = Transform3D(1, 0, 0, 0, 0.8660254, -0.5, 0, 0.5, 0.8660254, 0, 2.699695, -8.610111)
@@ -92,6 +98,8 @@ shape = SubResource("ConcavePolygonShape3D_noarx")
 
 [node name="RigidBody3D2" type="RigidBody3D" parent="." unique_id=736420436]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 4.7075686, -9.828935)
+collision_layer = 1
+collision_mask = 3
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="RigidBody3D2" unique_id=1980943919]
 mesh = SubResource("SphereMesh_a0tk4")
