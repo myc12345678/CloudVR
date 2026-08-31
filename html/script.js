@@ -1,3 +1,34 @@
+/* =====================================================================
+ * WebRTC 接收端（viewer）主脚本
+ * ---------------------------------------------------------------------
+ * 这个页面叫 viewer_<k>，干三件事：
+ *   1. 显示远端 sender_<k> 推过来的视频
+ *   2. 实时展示延迟 / 帧率 / 丢包等 WebRTC 统计
+ *   3. 把本机的鼠标 / 键盘 / 滚轮输入回传给 sender（远程操控）
+ *
+ * 三条彼此独立的通道（读代码时先分清"这段话属于哪条通道"）：
+ *   - WebSocket 信令通道（ws）: 只用来"约好怎么连"（分配身份、交换 offer/answer/ICE）。
+ *   - WebRTC 媒体通道（pc）: 真正传视频，跟 ws 完全无关。
+ *   - DOM 展示层: 状态灯、徽章、视频画面、日志面板。
+ *
+ * 目录
+ *   一、全局配置与核心状态
+ *   二、DOM 引用（跨区块共用的元素集中声明）
+ *   三、通用辅助函数（日志 / 状态灯 / 徽章 / 视频占位）
+ *   四、信令 WebSocket 层（连接 / 心跳 / 自动重连 / 协议分派 / 分配失败）
+ *   五、WebRTC 媒体层（PeerConnection + 信令消息处理）
+ *   六、视频元素事件
+ *   七、UI 交互（播放 / 全屏 / 浮层自动隐藏 / 清空日志 / 日志面板折叠）
+ *   八、用户输入回传（鼠标 / 键盘 / 滚轮）
+ *   九、延迟统计（WebRTC getStats）
+ *   十、启动流程
+ * ===================================================================== */
+
+// =====================================================================
+// 一、全局配置与核心状态
+// =====================================================================
+
+// 信令地址：跟随页面协议（https → wss，http → ws）
 const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsUrl = `${wsScheme}//${location.host}/ws`;
 
@@ -8,7 +39,23 @@ let selfId = '';
 let peerId = '';
 let maxUsers = 0; // 从 config.json 的 concurrency.max_users 读取，仅用于展示
 
-const logBox = document.getElementById('logBox');
+// WebSocket 与 PeerConnection 的全局句柄（被多个区块共享）
+let ws = null;
+let pc = null;
+let heartbeatTimer = null;   // 心跳定时器，防止 nginx 掐断连接
+let reconnectAttempts = 0;   // 重连次数计数；被置为 -1 表示"分配失败，不再重连"
+let reconnectTimer = null;
+
+// 常量配置
+const HEARTBEAT_INTERVAL_MS = 30000; // 每 30 秒发一次心跳，确保 nginx 连接不超时
+const MAX_RECONNECT_DELAY_MS = 30000; // 最大重连间隔 30 秒
+const MAX_LOG_LINES = 500; // 日志最大行数，防止 DOM 无限增长
+
+// =====================================================================
+// 二、DOM 引用（跨区块共用的元素集中声明，后续按需取用）
+// =====================================================================
+
+// ---- 状态灯与徽章（总状态 / 视频流 / 分辨率 / 各通道状态） ----
 const heroStatus = document.getElementById('heroStatus');
 const streamBadge = document.getElementById('streamBadge');
 const overallBadge = document.getElementById('overallBadge');
@@ -19,43 +66,29 @@ const pcStatusEl = document.getElementById('pcStatus');
 const iceStatusEl = document.getElementById('iceStatus');
 const videoStatusEl = document.getElementById('videoStatus');
 
+// 状态灯（彩点）元素，与上面的状态文字一一对应
 const wsDot = document.getElementById('wsDot');
 const pcDot = document.getElementById('pcDot');
 const iceDot = document.getElementById('iceDot');
 const videoDot = document.getElementById('videoDot');
 
+// ---- 视频区 ----
 const video = document.getElementById('remoteVideo');
-const videoIdle = document.getElementById('videoIdle');
+const videoIdle = document.getElementById('videoIdle'); // 未收到视频时的"等待中"占位层
+const videoShell = document.querySelector('.video-shell');
 const videoControls = document.querySelector('.video-controls');
 
-async function loadRuntimeConfig() {
-  try {
-    const resp = await fetch('config.json', { cache: 'no-store' });
-    if (resp.ok) {
-      const cfg = await resp.json();
-      // 并发上限：来自 config.json 的 concurrency.max_users，仅用于展示。
-      const c = cfg && cfg.concurrency;
-      if (c && typeof c.max_users === 'number') {
-        maxUsers = c.max_users;
-      }
-      console.log('[config] 已从 config.json 加载运行时配置', { maxUsers });
-    } else {
-      console.warn('[config] 读取 config.json 失败 HTTP ' + resp.status + '，使用内置默认值');
-    }
-  } catch (e) {
-    console.warn('[config] 加载 config.json 失败，使用内置默认值', e);
-  }
-}
+// ---- 运行日志面板 ----
+const logBox = document.getElementById('logBox');
+const logsPanel = document.querySelector('.logs-panel');
+const logsToggle = document.getElementById('logsToggle');
+const logsArrow = document.getElementById('logsArrow');
 
-let ws = null;
-let pc = null;
-let heartbeatTimer = null;
-let reconnectAttempts = 0;
-let reconnectTimer = null;
-const HEARTBEAT_INTERVAL_MS = 30000; // 每 30 秒发送一次心跳，确保 nginx 连接不超时
-const MAX_RECONNECT_DELAY_MS = 30000; // 最大重连间隔 30 秒
-const MAX_LOG_LINES = 500; // 日志最大行数，防止 DOM 无限增长
+// =====================================================================
+// 三、通用辅助函数（日志 / 状态灯 / 徽章 / 视频占位）
+// =====================================================================
 
+// 把任意参数转成可打印字符串（字符串原样，其它走 JSON）
 function stringifyArg(arg) {
   if (typeof arg === 'string')
     return arg;
@@ -66,6 +99,7 @@ function stringifyArg(arg) {
   }
 }
 
+// 更新日志面板底部的计数（"N 条日志" 和角标）
 function updateLogCount() {
   const n = logBox.children.length;
   const el = document.getElementById('logCount');
@@ -74,11 +108,13 @@ function updateLogCount() {
   if (badge) badge.textContent = n;
 }
 
+// 控制"等待视频流"占位层的显隐
 function setVideoIdle(visible) {
   if (!videoIdle) return;
   videoIdle.classList.toggle('hide', !visible);
 }
 
+// 页面内日志：同时打印到控制台，并追加到面板，超长时移除最旧条目
 function log(...args) {
   console.log(...args);
   const line = document.createElement('div');
@@ -94,6 +130,7 @@ function log(...args) {
   updateLogCount();
 }
 
+// 设置某个状态灯：更新文字 + 按值染色（good=绿 / bad=红 / info=蓝）
 function setStatus(textEl, dotEl, value) {
   textEl.textContent = value;
   dotEl.className = 'dot';
@@ -108,19 +145,25 @@ function setStatus(textEl, dotEl, value) {
   }
 }
 
+// 更新页面顶部的"总状态"文字
 function updateHero(text) {
   overallBadge.textContent = text;
   if (heroStatus) heroStatus.textContent = text;
 }
 
-// ========== WebSocket 自动重连（指数退避） ==========
+// =====================================================================
+// 四、信令 WebSocket 层
+//   负责：建立 ws 连接、心跳保活、断线指数退避重连、
+//         解析服务器下发的信令（分配身份 / 会话注册 / 错误页）。
+//   注意：这一步只"约好怎么连"，真正的视频走 WebRTC（见第五节）。
+// =====================================================================
 
+// 指数退避重连：1s, 2s, 4s, ... 上限 30s
 function scheduleReconnect() {
   if (reconnectTimer) return;
   // 分配失败后不再重连（reconnectAttempts 被置为 -1）
   if (reconnectAttempts < 0) return;
 
-  // 指数退避: 1s, 2s, 4s, 8s, 16s, 最大 30s
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS);
   reconnectAttempts++;
   log(`将在 ${(delay / 1000).toFixed(1)}s 后自动重连 (第 ${reconnectAttempts} 次)`);
@@ -132,6 +175,7 @@ function scheduleReconnect() {
   }, delay);
 }
 
+// 重置 WebRTC 状态（重连 / 断线时需要重新协商）
 function resetWebRTC() {
   stopLatencyPolling();
   if (pc) {
@@ -148,16 +192,18 @@ function resetWebRTC() {
   setVideoIdle(true);
 }
 
+// 建立唯一的 WebSocket 信令连接
 function connectWebSocket() {
-  updateHero('\u8FDE\u63A5\u4FE1\u4EE4\u670D\u52A1\u4E2D');
+  updateHero('连接信令服务中');
   setStatus(wsStatusEl, wsDot, 'connecting');
 
   ws = new WebSocket(wsUrl);
 
+  // ---- 连接成功：分配身份 + 启动心跳 ----
   ws.onopen = () => {
     log('WS connected');
     setStatus(wsStatusEl, wsDot, 'connected');
-    updateHero('\u4FE1\u4EE4\u670D\u52A1\u5DF2\u8FDE\u63A5');
+    updateHero('信令服务已连接');
 
     // 重连成功，重置计数器
     reconnectAttempts = 0;
@@ -177,10 +223,11 @@ function connectWebSocket() {
     }, HEARTBEAT_INTERVAL_MS);
   };
 
+  // ---- 连接关闭：清理并安排重连 ----
   ws.onclose = () => {
     log('WS closed');
     setStatus(wsStatusEl, wsDot, 'closed');
-    updateHero('\u4FE1\u4EE4\u670D\u52A1\u5DF2\u65AD\u5F00');
+    updateHero('信令服务已断开');
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -190,13 +237,15 @@ function connectWebSocket() {
     scheduleReconnect();
   };
 
+  // ---- 连接出错：仅记录，重连交给 onclose 处理 ----
   ws.onerror = (event) => {
     log('WS error', event.type || event);
     setStatus(wsStatusEl, wsDot, 'error');
-    updateHero('\u4FE1\u4EE4\u670D\u52A1\u9519\u8BEF');
+    updateHero('信令服务错误');
     // onerror 后通常会触发 onclose，重连逻辑由 onclose 处理
   };
 
+  // ---- 收到信令：按前缀分派到不同处理分支 ----
   ws.onmessage = async (event) => {
     const data = event.data;
     log('WS RECV:', data);
@@ -218,7 +267,7 @@ function connectWebSocket() {
         document.getElementById('peerLabel').textContent = peerId;
         document.getElementById('selfLabel').textContent = selfId;
         log(`已分配用户 ${k}，selfId=${selfId}, peerId=${peerId}`);
-        updateHero('\u5DF2\u5206\u914D\u7528\u6237\uFF0C\u51C6\u5907\u5EFA\u7ACB\u4F1A\u8BDD');
+        updateHero('已分配用户，准备建立会话');
         ws.send('SESSION ' + peerId);
         return;
       }
@@ -233,13 +282,13 @@ function connectWebSocket() {
 
       if (data.startsWith('HELLO_OK')) {
         ws.send('SESSION ' + peerId);
-        updateHero('\u5DF2\u6CE8\u518C\uFF0C\u51C6\u5907\u5EFA\u7ACB\u4F1A\u8BDD');
+        updateHero('已注册，准备建立会话');
         return;
       }
 
       if (data.startsWith('SESSION_OK')) {
         log('SESSION_OK');
-        updateHero('\u4F1A\u8BDD\u5EFA\u7ACB\uFF0C\u89E6\u53D1\u534F\u5546');
+        updateHero('会话建立，触发协商');
         ws.send(JSON.stringify({ reset: true }));
         return;
       }
@@ -249,6 +298,7 @@ function connectWebSocket() {
         return;
       }
 
+      // 以 '{' 开头的 JSON 消息 → WebRTC 信令（offer/answer/ICE），交给第五节处理
       if (data[0] === '{') {
         const msg = JSON.parse(data);
         await handleSignallingMessage(msg);
@@ -257,6 +307,35 @@ function connectWebSocket() {
   };
 }
 
+// 分配失败：隐藏主界面，显示错误页，停止所有重连
+function showAssignFailed(reason) {
+  const page = document.querySelector('.page');
+  const errorPage = document.getElementById('assignErrorPage');
+  if (page) page.style.display = 'none';
+  if (errorPage) {
+    errorPage.style.display = '';
+    const detail = document.getElementById('assignErrorDetail');
+    if (detail) detail.textContent = reason || '未知原因';
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (e) { /* ignore */ }
+  }
+  // 停止后续重连
+  reconnectAttempts = -1;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+// =====================================================================
+// 五、WebRTC 媒体层
+//   负责：创建 PeerConnection、处理信令里的 offer/answer/ICE，
+//         以及把到来的远端视频轨接到 <video>。
+//   真正的视频数据在这条通道里流动，与 ws 无关。
+// =====================================================================
+
+// 创建唯一的一个 RTCPeerConnection（已存在则直接复用）
 async function createPeerConnection() {
   if (pc)
     return pc;
@@ -268,21 +347,25 @@ async function createPeerConnection() {
   setStatus(pcStatusEl, pcDot, pc.connectionState || 'new');
   setStatus(iceStatusEl, iceDot, pc.iceConnectionState || 'new');
 
+  // PeerConnection 整体连接状态变化
   pc.onconnectionstatechange = () => {
     log('pc.connectionState =', pc.connectionState);
     setStatus(pcStatusEl, pcDot, pc.connectionState);
     updateHero('PeerConnection: ' + pc.connectionState);
   };
 
+  // ICE 连接状态变化
   pc.oniceconnectionstatechange = () => {
     log('pc.iceConnectionState =', pc.iceConnectionState);
     setStatus(iceStatusEl, iceDot, pc.iceConnectionState);
   };
 
+  // ICE 候选收集状态变化（仅记录）
   pc.onicegatheringstatechange = () => {
     log('pc.iceGatheringState =', pc.iceGatheringState);
   };
 
+  // 收集到 ICE 候选：通过 ws 发给对端（末尾空候选表示收集结束）
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       const iceMsg = {
@@ -305,10 +388,11 @@ async function createPeerConnection() {
     }
   };
 
+  // 收到远端视频轨：接到 <video>，并立即低延迟配置
   pc.ontrack = (event) => {
     log('ontrack:', event.streams, 'track=', event.track && event.track.kind, event.track);
-    streamBadge.textContent = '\u5DF2\u6536\u5230\u8FDC\u7AEF\u89C6\u9891\u8F68';
-    updateHero('\u5DF2\u6536\u5230\u8FDC\u7AEF\u89C6\u9891\u8F68');
+    streamBadge.textContent = '已收到远端视频轨';
+    updateHero('已收到远端视频轨');
 
     // jitter buffer 控制在 setRemoteDescription 后立即执行，这里做兜底
     // ontrack 触发时 buffer 可能已有数据，立即加速排出
@@ -330,6 +414,7 @@ async function createPeerConnection() {
   return pc;
 }
 
+// 处理通过 ws 收到的 WebRTC 信令（offer/answer/ICE）
 async function handleSignallingMessage(msg) {
   const pc = await createPeerConnection();
 
@@ -339,7 +424,7 @@ async function handleSignallingMessage(msg) {
 
     if (type === 'offer') {
       log('Received offer');
-      updateHero('\u6536\u5230 Offer\uFF0C\u6B63\u5728\u5E94\u7B54');
+      updateHero('收到 Offer，正在应答');
 
       await pc.setRemoteDescription({ type: 'offer', sdp });
 
@@ -387,6 +472,11 @@ async function handleSignallingMessage(msg) {
   }
 }
 
+// =====================================================================
+// 六、视频元素事件
+//   监听 <video> 的播放 / 缓冲 / 出错等事件，用于更新状态与徽章。
+// =====================================================================
+
 video.onwaiting = () => {
   log('video waiting (buffering…)');
 };
@@ -400,15 +490,15 @@ video.oncanplay = () => {
 };
 
 video.onloadedmetadata = () => {
-  const text = `${video.videoWidth} \u00D7 ${video.videoHeight}`;
-  resolutionBadge.textContent = '\u5206\u8FA8\u7387: ' + text;
+  const text = `${video.videoWidth} × ${video.videoHeight}`;
+  resolutionBadge.textContent = '分辨率: ' + text;
   log('video loadedmetadata', video.videoWidth, video.videoHeight);
 };
 
 video.onplaying = () => {
   setStatus(videoStatusEl, videoDot, 'playing');
-  streamBadge.textContent = '\u89C6\u9891\u64AD\u653E\u4E2D';
-  updateHero('\u89C6\u9891\u64AD\u653E\u4E2D');
+  streamBadge.textContent = '视频播放中';
+  updateHero('视频播放中');
   log('video playing', video.videoWidth, video.videoHeight);
   setVideoIdle(false);
   startLatencyPolling();
@@ -424,6 +514,13 @@ video.onerror = (e) => {
   log('video error', e);
 };
 
+// =====================================================================
+// 七、UI 交互
+//   播放按钮 / 全屏 / 浮层自动隐藏 / 清空日志 / 日志面板折叠。
+//   这些跟连接、传输无关，纯属页面交互。
+// =====================================================================
+
+// ---- 手动播放按钮（应对浏览器自动播放策略拦截） ----
 document.getElementById('playButton').onclick = () => {
   log('click play, video=', video, 'srcObject=', video && video.srcObject);
   if (video && video.srcObject) {
@@ -435,8 +532,7 @@ document.getElementById('playButton').onclick = () => {
   }
 };
 
-// ========== 视频全屏 ==========
-const videoShell = document.querySelector('.video-shell');
+// ---- 视频全屏 ----
 const fullscreenButton = document.getElementById('fullscreenButton');
 const fullscreenLabel = document.getElementById('fullscreenLabel');
 
@@ -457,6 +553,7 @@ if (fullscreenButton) {
   fullscreenButton.addEventListener('click', toggleFullscreen);
 }
 
+// 全屏状态变化时更新按钮文案
 if (document.addEventListener) {
   document.addEventListener('fullscreenchange', () => {
     if (fullscreenLabel) {
@@ -470,7 +567,7 @@ if (video) {
   video.addEventListener('dblclick', toggleFullscreen);
 }
 
-// ========== 视频浮层按钮自动隐藏 ==========
+// ---- 视频浮层按钮自动隐藏 ----
 let hideControlsTimer = null;
 function showVideoControls() {
   if (!videoControls) return;
@@ -490,21 +587,18 @@ if (videoShell && videoControls) {
   showVideoControls();
 }
 
+// ---- 清空日志 ----
 document.getElementById('clearLogButton').onclick = () => {
   logBox.innerHTML = '';
-  log('\u65E5\u5FD7\u5DF2\u6E05\u7A7A');
+  log('日志已清空');
 };
 
-// ========== 日志侧边栏折叠 / 展开 ==========
-const logsPanel = document.querySelector('.logs-panel');
-const logsToggle = document.getElementById('logsToggle');
-const logsArrow = document.getElementById('logsArrow');
-
+// ---- 日志侧边栏折叠 / 展开 ----
 function setLogsCollapsed(collapsed) {
   if (!logsPanel) return;
   logsPanel.classList.toggle('collapsed', collapsed);
   if (logsToggle) logsToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  if (logsArrow) logsArrow.textContent = collapsed ? '\u2039' : '\u203A';
+  if (logsArrow) logsArrow.textContent = collapsed ? '‹' : '›';
   if (!collapsed && logBox) logBox.scrollTop = logBox.scrollHeight;
 }
 
@@ -523,42 +617,13 @@ if (logsToggle) {
   });
 }
 
-// 分配失败：隐藏主界面，显示错误页，不再自动重连。
-function showAssignFailed(reason) {
-  const page = document.querySelector('.page');
-  const errorPage = document.getElementById('assignErrorPage');
-  if (page) page.style.display = 'none';
-  if (errorPage) {
-    errorPage.style.display = '';
-    const detail = document.getElementById('assignErrorDetail');
-    if (detail) detail.textContent = reason || '未知原因';
-  }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.close(); } catch (e) { /* ignore */ }
-  }
-  // 停止后续重连
-  reconnectAttempts = -1;
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-}
+// =====================================================================
+// 八、用户输入回传
+//   把本机鼠标 / 键盘 / 滚轮操作转成 { input: {...} }，经 ws 发给 sender，
+//   前端做节流 + 缓存视频布局矩形（避免 mousemove 里高频 getBoundingClientRect 触发重排）。
+// =====================================================================
 
-// ========== 启动：先加载运行时配置（config.json），再连接信令 ==========
-async function init() {
-  await loadRuntimeConfig();
-
-  document.getElementById('wsUrlText').textContent = wsUrl;
-
-  setStatus(wsStatusEl, wsDot, 'connecting');
-  setStatus(pcStatusEl, pcDot, 'new');
-  setStatus(iceStatusEl, iceDot, 'new');
-  setStatus(videoStatusEl, videoDot, 'idle');
-  connectWebSocket();
-}
-init();
-
-// ========== 用户输入回传 ==========
+// 经 ws 发送一条输入消息
 function sendInput(type, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ input: { type, ...data } }));
@@ -567,8 +632,8 @@ function sendInput(type, data) {
 
 const INPUT_THROTTLE_MS = 16; // ~60fps for mousemove
 
-// 缓存 video 元素的布局矩形，避免 mousemove 中高频调用 getBoundingClientRect()
-// getBoundingClientRect() 会强制浏览器同步重排，是性能反模式
+// ---- 缓存 video 元素的布局矩形 ----
+// getBoundingClientRect() 会强制浏览器同步重排，是性能反模式，故缓存起来
 let cachedVideoRect = null;
 
 function updateCachedVideoRect() {
@@ -577,7 +642,7 @@ function updateCachedVideoRect() {
   }
 }
 
-// 在窗口尺寸/滚动变化时刷新缓存
+// 在窗口尺寸 / 滚动变化时刷新缓存
 window.addEventListener('resize', updateCachedVideoRect);
 window.addEventListener('scroll', updateCachedVideoRect, { passive: true });
 
@@ -589,6 +654,7 @@ function getVideoRect() {
   return cachedVideoRect;
 }
 
+// ---- 鼠标移动（节流 + 归一化坐标） ----
 let lastMouseSend = 0;
 document.addEventListener('mousemove', (e) => {
   const now = Date.now();
@@ -603,6 +669,7 @@ document.addEventListener('mousemove', (e) => {
   });
 });
 
+// ---- 键盘按下 / 抬起 ----
 document.addEventListener('keydown', (e) => {
   // 阻止默认行为避免页面滚动等
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
@@ -615,6 +682,7 @@ document.addEventListener('keyup', (e) => {
   sendInput('keyup', { key: e.key, code: e.code });
 });
 
+// ---- 鼠标在视频区域内按下 / 抬起 / 滚轮 ----
 video.addEventListener('mousedown', (e) => {
   const rect = video.getBoundingClientRect();
   sendInput('mousedown', {
@@ -638,7 +706,11 @@ video.addEventListener('wheel', (e) => {
   sendInput('wheel', { deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ });
 });
 
-// ========== 延迟统计（WebRTC getStats API） ==========
+// =====================================================================
+// 九、延迟统计（WebRTC getStats API）
+//   与连接 / UI 无关：每 2 秒调一次 getStats，算出 RTT、抖动延迟、
+//   解码耗时、接收帧率、丢包 / 丢帧率，更新到状态栏。
+// =====================================================================
 
 const latencyValue = document.getElementById('latencyValue');
 const latencyDetail = document.getElementById('latencyDetail');
@@ -651,6 +723,7 @@ let lastFramesDecoded = 0;
 let lastFramesReceived = 0;
 let lastPacketsReceived = 0;
 
+// 按延迟毫秒数给主数值染色（<80 绿 / <200 黄 / 否则红）
 function setLatencyClass(ms) {
   latencyValue.classList.remove('good', 'warn', 'bad');
   if (ms < 80) {
@@ -817,12 +890,14 @@ async function pollLatency() {
   }
 }
 
+// 启动延迟轮询（在视频开始播放后调用）
 function startLatencyPolling() {
   if (latencyTimer) clearInterval(latencyTimer);
   pollLatency();
   latencyTimer = setInterval(pollLatency, LATENCY_POLL_MS);
 }
 
+// 停止延迟轮询并复位显示
 function stopLatencyPolling() {
   if (latencyTimer) {
     clearInterval(latencyTimer);
@@ -832,3 +907,39 @@ function stopLatencyPolling() {
   latencyValue.classList.remove('good', 'warn', 'bad');
   latencyDetail.innerHTML = '';
 }
+
+// =====================================================================
+// 十、启动流程
+//   先加载运行时配置（config.json），再连接信令。
+// =====================================================================
+async function loadRuntimeConfig() {
+  try {
+    const resp = await fetch('config.json', { cache: 'no-store' });
+    if (resp.ok) {
+      const cfg = await resp.json();
+      // 并发上限：来自 config.json 的 concurrency.max_users，仅用于展示。
+      const c = cfg && cfg.concurrency;
+      if (c && typeof c.max_users === 'number') {
+        maxUsers = c.max_users;
+      }
+      console.log('[config] 已从 config.json 加载运行时配置', { maxUsers });
+    } else {
+      console.warn('[config] 读取 config.json 失败 HTTP ' + resp.status + '，使用内置默认值');
+    }
+  } catch (e) {
+    console.warn('[config] 加载 config.json 失败，使用内置默认值', e);
+  }
+}
+
+async function init() {
+  await loadRuntimeConfig();
+
+  document.getElementById('wsUrlText').textContent = wsUrl;
+
+  setStatus(wsStatusEl, wsDot, 'connecting');
+  setStatus(pcStatusEl, pcDot, 'new');
+  setStatus(iceStatusEl, iceDot, 'new');
+  setStatus(videoStatusEl, videoDot, 'idle');
+  connectWebSocket();
+}
+init();
