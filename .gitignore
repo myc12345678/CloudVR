@@ -37,6 +37,9 @@ signalling-server/certs/*
 *.bak
 *.swp
 *~
+# 编辑器自动保存文件：Emacs 为 `#file#`（首字符 # 需转义，否则被当成注释）与 `.#file`
+\#*#
+.#*
 
 # ---- 毕业设计文档（本地生成，整个目录不进入仓库）----
 thesis/
