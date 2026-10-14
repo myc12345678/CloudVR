@@ -19,7 +19,7 @@
 |------|------|------|
 | `signalling-server` | Node.js（无需 npm 安装任何包） | v26 |
 | `html/`（nginx） | nginx | 1.31 |
-| `Gstreamer/` | C++17（g++/make）、GStreamer ≥1.20（`gstreamer-webrtc`、`gstreamer-sdp`、`gstreamer-app`、`libsoup-3.0`、`json-glib-1.0`） | GStreamer 1.28 |
+| `Gstreamer/` | C++17（g++）+ CMake ≥3.16 + pkg-config、GStreamer ≥1.20（`gstreamer-webrtc`、`gstreamer-sdp`、`gstreamer-app`、`libsoup-3.0`、`json-glib-1.0`） | GStreamer 1.28 |
 | `Godot/test/` | Godot 4.x（Forward+ / Vulkan） | 4.7 |
 | 视频编码 | NVIDIA GPU + 驱动（NVENC 硬件编码，见 `config.json` 的 `encoding.type`） | RTX 4060 |
 | `scripts/` | Python 3 | 3.14 |
@@ -39,9 +39,9 @@ cp config.json.example config.json          # config.json 已 gitignore，不入
 # 2) 拉取 WebRTC GDExtension 预编译库（仅克隆到新机器时需要）
 git lfs install
 
-# 3) 构建 GStreamer 发送端
-cd Gstreamer && make                        # 产物为 webrtc_sender（已 gitignore）
-cd ..
+# 3) 构建 GStreamer 发送端（CMake）
+cmake -B build                              # 配置（默认 Release）
+cmake --build build -j                      # 产物为 build/webrtc_sender（已 gitignore）
 
 # 4) 首次导入 Godot 项目（生成 .godot 导入缓存 / UID 映射）。
 #    若缺失，直接运行会报 “Main scene's path could not be resolved from UID”。
@@ -69,7 +69,7 @@ cd signalling-server && node server.js
 nginx -c "$(pwd)/html/nginx.conf"
 
 # 3) sender（会自动 fork/exec 启动 Godot，并注入 NVIDIA PRIME 环境变量）
-cd Gstreamer && ./webrtc_sender
+./build/webrtc_sender                        # 从仓库根目录运行（会读到 ./config.json）
 ```
 
 - Godot 子进程由 sender 监控，崩溃后自动指数退避重启（`1s→2s→…→30s`）。
@@ -117,7 +117,7 @@ nginx -c "$(pwd)/html/nginx.conf"
 ### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC）
 
 ```bash
-cd Gstreamer && ./webrtc_sender
+cd <仓库根目录> && ./build/webrtc_sender
 ```
 - 按 `max_users` 启动对应数量的 GStreamer 管线与 shm 读取线程（零拷贝）
 - 按 GPU 启动 TCP 控制通道（端口 `tcp_port_base + gpu`），接收输入并带 `player` 索引转发
@@ -245,7 +245,7 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 
 所有子系统均在**运行时**读取该文件，无需重新编译：
 
-- `Gstreamer/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `Gstreamer/config.cpp`）。
+- `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `Gstreamer/config.cpp`）。
   可用 `--config <path>` 显式指定；默认依次查找当前目录及上级目录的 `config.json`。
 - `html/script.js`：页面启动时 `fetch('/config.json')` 读取（nginx 在 `/config.json` 暴露它，
   见 `html/nginx.conf`）。
@@ -297,11 +297,23 @@ clone 后只会得到指针而不是真实二进制。
 
 ## 构建（GStreamer 端）
 
+构建入口为仓库根目录的 `CMakeLists.txt`（原先的 `Gstreamer/Makefile` 已移除）。
+
 ```bash
-cd Gstreamer && make
+# 配置 + 编译（默认 Release）
+cmake -B build
+cmake --build build -j
+
+# 可选：调试构建 / sanitizer 构建
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -B build-asan -DENABLE_ASAN=ON     # AddressSanitizer
+cmake -B build-tsan -DENABLE_TSAN=ON     # ThreadSanitizer
 ```
 
-产物为 `webrtc_sender`（已 gitignore，不入库）。此命令与「一次性的初始化」第 3 步相同，单列便于快速查找。
+产物为 `build/webrtc_sender`（`build/` 已 gitignore，不入库）。
+配置阶段会校验 GStreamer ≥ 1.20（代码用到 `gst_app_src_set_leaky_type`），
+版本不满足会直接报错而不是留到运行期。
+`build/compile_commands.json` 可供 clangd / IDE 索引使用。
 
 ## 常见问题排查
 

@@ -14,7 +14,12 @@ config.json
 # Gstreamer/config.h 现为手写的运行时配置头文件，需入库；由 config.cpp 在
 # 启动时解析 config.json。
 
-# ---- GStreamer 构建产物 ----
+# ---- CMake 构建目录（构建入口为仓库根的 CMakeLists.txt）----
+/build/
+/build-*/
+
+# ---- 旧 Makefile 时代的源码内构建产物 ----
+# （构建已迁移到 CMake；保留这些规则以防遗留的 .o/.d 被误提交）
 Gstreamer/*.o
 Gstreamer/*.d
 Gstreamer/webrtc_sender

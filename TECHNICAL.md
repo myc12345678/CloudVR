@@ -509,9 +509,13 @@ _physics_process(delta):
 ### 4.2 编译 GStreamer 发送端
 
 ```bash
-cd Gstreamer
-make                                # 编译 webrtc_sender（配置在运行时从 config.json 读取）
+cmake -B build                      # 配置（默认 Release；校验 GStreamer >= 1.20）
+cmake --build build -j              # 编译，产物 build/webrtc_sender
 ```
+
+构建入口为仓库根的 `CMakeLists.txt`（原 `Gstreamer/Makefile` 已移除）。
+可选 `-DCMAKE_BUILD_TYPE=Debug`、`-DENABLE_ASAN=ON`、`-DENABLE_TSAN=ON`。
+配置在运行时从 `config.json` 读取，与构建无关。
 
 ### 4.3 启动顺序
 
@@ -531,7 +535,7 @@ node signalling-server/server.js &
 #    nginx -c html/nginx.conf
 
 # 3. 启动 GStreamer 发送端（自动 fork/exec 启动 Godot，注入 PRIME 环境变量）
-cd Gstreamer && ./webrtc_sender &
+./build/webrtc_sender &                     # 从仓库根目录运行（读取 ./config.json）
 
 # 4. 浏览器访问（无需 URL 参数，自动分配用户槽位）
 #    https://127.0.0.1:8444/
@@ -550,7 +554,7 @@ node signalling-server/server.js &
 ./scripts/run_godot.sh
 
 # 4. 启动 GStreamer 发送端
-cd Gstreamer && ./webrtc_sender &
+./build/webrtc_sender &
 
 # 5. 浏览器访问
 #    https://127.0.0.1:8444/
@@ -563,7 +567,7 @@ cd Gstreamer && ./webrtc_sender &
 
 ```bash
 # GStreamer sender（自动在运行时重新解析 config.json）
-cd Gstreamer && ./webrtc_sender
+./build/webrtc_sender
 ```
 
 ---
@@ -647,7 +651,7 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 │   ├── tcp_server.cpp / tcp_server.h    # TCP 控制（每 GPU 一条）+ 共享内存读取
 │   ├── common.cpp / common.h            # 全局状态 + g_sessions/g_gpu_tcp
 │   ├── shared_frame.h                   # 共享内存数据布局（头部固定 16 字节）
-│   └── Makefile                         # 编译脚本
+│   └── （构建脚本已上移到仓库根的 CMakeLists.txt）
 ├── signalling-server/
 │   ├── server.js                        # 纯 Node.js 信令服务器 + 槽位自动分配
 │   └── certs/                           # TLS 证书
