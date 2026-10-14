@@ -1,5 +1,6 @@
 #include "config/config.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <json-glib/json-glib.h>
 
@@ -187,6 +188,18 @@ bool load_config(Config &cfg, const std::string &config_path) {
         get_string(s, "path_template", cfg.shm_path_template);
   }
 
+  // ---- HTTP / 静态资源 / TLS ----
+  if (JsonObject *h = get_object(obj, "http")) {
+    cfg.http_listen_host = get_string(h, "listen_host", cfg.http_listen_host);
+    cfg.http_port = get_int(h, "port", cfg.http_port);
+    cfg.http_web_root = get_string(h, "web_root", cfg.http_web_root);
+    cfg.http_tls_cert_path =
+        get_string(h, "tls_cert_path", cfg.http_tls_cert_path);
+    // 私钥路径通常留空，由环境变量 CLOUDVR_TLS_KEY 注入（见 apply_env_overrides）。
+    cfg.http_tls_key_path =
+        get_string(h, "tls_key_path", cfg.http_tls_key_path);
+  }
+
   // ---- 派生的运行期尺寸 ----
   cfg.shm_frame_max_size =
       static_cast<size_t>(cfg.frame_width) * cfg.frame_height * 3; // RGB8
@@ -208,4 +221,50 @@ bool load_config_from_candidates(Config &cfg,
   std::cerr << "config.json not found (searched " << paths.size()
             << " candidate path(s)) -- using built-in defaults" << std::endl;
   return false;
+}
+
+// ======================== 环境变量覆盖 ========================
+// 敏感/机器相关的字段支持用环境变量注入，且优先级高于 config.json：
+//   - 私钥一类敏感值不必写进 config.json（该文件可能被误分发/误提交）
+//   - 容器/CI 部署时无需改写配置文件
+namespace {
+// 读取环境变量；未设置或为空串时返回 nullptr（语义为"不覆盖"）。
+const char *env_nonempty(const char *name) {
+  const char *v = std::getenv(name);
+  return (v && *v != '\0') ? v : nullptr;
+}
+} // namespace
+
+int apply_env_overrides(Config &cfg) {
+  int applied = 0;
+
+  if (const char *v = env_nonempty("CLOUDVR_TLS_CERT")) {
+    cfg.http_tls_cert_path = v;
+    ++applied;
+  }
+  if (const char *v = env_nonempty("CLOUDVR_TLS_KEY")) {
+    cfg.http_tls_key_path = v;
+    ++applied;
+  }
+  if (const char *v = env_nonempty("CLOUDVR_WEB_ROOT")) {
+    cfg.http_web_root = v;
+    ++applied;
+  }
+  if (const char *v = env_nonempty("CLOUDVR_HTTP_HOST")) {
+    cfg.http_listen_host = v;
+    ++applied;
+  }
+  if (const char *v = env_nonempty("CLOUDVR_HTTP_PORT")) {
+    char *end = nullptr;
+    const long port = std::strtol(v, &end, 10);
+    if (end != nullptr && *end == '\0' && port > 0 && port <= 65535) {
+      cfg.http_port = static_cast<int>(port);
+      ++applied;
+    } else {
+      std::cerr << "config: 忽略非法的 CLOUDVR_HTTP_PORT=\"" << v
+                << "\"（需为 1..65535 的整数）" << std::endl;
+    }
+  }
+
+  return applied;
 }

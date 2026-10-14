@@ -88,10 +88,17 @@
               WSS (WebRTC 信令 + WebRTC 媒体流 + 输入消息)
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
-│                     Nginx (反向代理)                                  │
-│  HTTP :8080  → 301 重定向到 HTTPS :8444                              │
-│  HTTPS :8444 → SSL 终端 + 静态文件服务 (html/, index test.html)       │
-│  /ws 路径    → proxy_pass https://127.0.0.1:8443 (signalling)       │
+│              前端入口（两种，当前阶段并存）                            │
+│                                                                      │
+│  A) webrtc_sender 内置 HTTP(S) —— 端口 8443                          │
+│     HTTPS :8443 → TLS 终端 + 静态文件 (config.http.web_root,          │
+│                   index test.html) + /config.json（白名单裁剪）        │
+│     /ws         → 尚未接入（返回 501，待信令合并）                     │
+│                                                                      │
+│  B) Nginx（旧入口，仍可用）—— 端口 8080 / 8444                        │
+│     HTTP  :8080 → 301 重定向到 HTTPS :8444                            │
+│     HTTPS :8444 → TLS 终端 + 静态文件服务 (html/, index test.html)     │
+│     /ws         → proxy_pass https://127.0.0.1:9443 (signalling)     │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
@@ -175,7 +182,7 @@ config.json
 | `godot.project_path` | Godot 项目目录（C++ 启动子进程用） | /path/to/Godot/test |
 | `godot.binary` / `launch` / `set_prime_env` | Godot 可执行文件 / 是否由 C++ 自动启动 / 是否注入 PRIME 环境变量 | godot / true / true |
 | `gstreamer.id_template.sender` / `.viewer` | 每用户信令 id 模板（`{index}` 展开为 u） | sender_{index} / viewer_{index} |
-| `gstreamer.signalling_url` | 信令服务器 WSS 地址 | wss://127.0.0.1:8443 |
+| `gstreamer.signalling_url` | 信令服务器 WSS 地址 | wss://127.0.0.1:9443 |
 | `encoding.type` | 编码器类型 | nvenc / vp8_sw |
 | `encoding.encoder` | GStreamer 编码器元素名 | nvautogpuh264enc |
 | `encoding.bitrate_kbps` | 编码码率 (kbps) | 15000 |
@@ -560,7 +567,40 @@ node signalling-server/server.js &
 #    https://127.0.0.1:8444/
 ```
 
-### 4.4 配置调整
+### 4.4 内置 HTTP 服务（`src/http/`，P2 替代 nginx）
+
+由 `webrtc_sender` 随进程启动，在 `config.http.port`（默认 **8443**）上提供：
+
+| 路径 | 行为 |
+|---|---|
+| `/` | 从 `config.http.web_root`（默认 `html`）读取静态资源；`/` 映射到 `index`（`test.html`） |
+| `/config.json` | 返回**白名单裁剪**的公开配置（当前仅 `concurrency.max_users`） |
+| `/ws` | 信令 WebSocket —— **尚未接入**，返回 `501`（待 P3 合并 `signalling-server/`） |
+| 其他 | `404`；非白名单扩展名一律拒绝 |
+
+实现要点（均为踩过的坑/有意设计）：
+
+- **TLS 必须显式传 `SOUP_SERVER_LISTEN_HTTPS`**：只调用 `soup_server_set_tls_certificate()`
+  并不会启用加密，`soup_server_listen_all()` 的 options 里漏掉该标志会**静默退化为明文 HTTP**
+  （页面照常打开，流量却未加密）。当前实现固定传入该标志。
+- **证书/私钥缺失即拒绝启动**（打印明确原因），而不是降级成明文；视频链路不受影响。
+- **静态资源按扩展名白名单**（`.html/.js/.css/.json/.svg/.png/.ico/.woff2`），因此
+  `html/nginx.conf` 这类含证书路径的文件不会被误发。
+- **路径穿越双重防护**：拒绝含 `..` 的路径，且 canonical 化后必须仍落在 `web_root` 之内。
+  实测 `/../signalling-server/certs/dev-key.pem` → `404`，私钥不可达。
+- **公开配置白名单**：原先 nginx 直接 `alias` 整份 `config.json`，把绝对路径、证书路径、
+  拓扑、编码参数全部暴露给任意访客；现仅下发前端真正使用的字段。
+
+**敏感字段用环境变量注入**（优先级高于 `config.json`）：
+`CLOUDVR_TLS_KEY`、`CLOUDVR_TLS_CERT`、`CLOUDVR_HTTP_PORT`、`CLOUDVR_HTTP_HOST`、
+`CLOUDVR_WEB_ROOT`。启动日志会打印 `config: 环境变量覆盖了 N 个字段`。
+
+```bash
+# 私钥不写进 config.json，部署时注入
+CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
+```
+
+### 4.5 配置调整
 
 `config.json` 在运行时被各子系统读取，修改后**无需重新编译**，只需重启对应进程
 （浏览器刷新页面即可）：
@@ -650,7 +690,8 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 │   ├── capture/godot_process.cpp / .h   # Godot 子进程启动/重启/关停
 │   ├── transport/tcp_server.cpp / .h    # TCP 控制（每 GPU 一条）+ 共享内存读取
 │   ├── encode/pipeline.cpp / .h         # GStreamer Pipeline 构建（每用户一条）
-│   ├── signalling/signalling.cpp / .h   # 信令 WebSocket 客户端（按 u 隔离）
+│   ├── signalling/signalling.cpp / .h   # 信令 WebSocket 客户端（按 u 隔离；合并后删除）
+│   ├── http/http_server.cpp / .h        # 内置 HTTP(S)：静态资源 + 公开配置 + TLS（替代 nginx）
 │   └── util/common.cpp / .h             # 全局状态 + g_sessions/g_gpu_tcp
 ├── signalling-server/
 │   ├── server.js                        # 纯 Node.js 信令服务器 + 槽位自动分配

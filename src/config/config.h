@@ -47,6 +47,16 @@ struct Config {
   std::string signalling_url = "wss://127.0.0.1:8443";
   std::string signalling_ca_path;
 
+  // ---- HTTP / 静态资源 / TLS（P2：替代 nginx，后续并入信令成为唯一对外入口）----
+  //   - 合并完成后 8443 是唯一对外端口：页面 + /config.json + /ws 都在这里
+  //   - /config.json 只暴露白名单字段（见 http_server 的公开配置生成逻辑）
+  //   - 证书/私钥属于敏感字段，支持用环境变量覆盖（见 apply_env_overrides）
+  std::string http_listen_host = "0.0.0.0";
+  int http_port = 8443;
+  std::string http_web_root = "html"; // 前端静态资源目录
+  std::string http_tls_cert_path;     // 服务器证书（PEM）
+  std::string http_tls_key_path;      // 私钥（PEM，敏感：建议 CLOUDVR_TLS_KEY 注入）
+
   // ---- Encoding ----
   std::string enc_codec_name = "h264";
   bool enc_is_hardware = true;
@@ -75,6 +85,16 @@ bool load_config(Config &cfg, const std::string &config_path);
 // 依次尝试候选路径，加载第一个存在的 config.json。
 bool load_config_from_candidates(Config &cfg,
                                  const std::vector<std::string> &paths);
+
+// 用环境变量覆盖配置中的敏感/机器相关字段（环境变量优先级最高）。
+// 支持的变量：
+//   CLOUDVR_TLS_CERT   服务器证书路径      → http.tls_cert_path
+//   CLOUDVR_TLS_KEY    私钥路径（敏感）    → http.tls_key_path
+//   CLOUDVR_HTTP_PORT  HTTP 监听端口       → http.port
+//   CLOUDVR_WEB_ROOT   前端静态资源目录    → http.web_root
+//   CLOUDVR_HTTP_HOST  监听地址            → http.listen_host
+// 未设置的变量不改变对应字段。返回实际生效的覆盖项数量（便于启动日志）。
+int apply_env_overrides(Config &cfg);
 
 // 把模板中的 "{index}" 占位符替换为十进制 index（不含占位符则原样返回）。
 // P1 定义并用于校验/日志；后续阶段由 UserSession 按用户索引 u 逐个消费。

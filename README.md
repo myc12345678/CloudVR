@@ -7,9 +7,9 @@
 | 路径 | 内容 |
 |------|------|
 | `Godot/test/` | Godot 游戏引擎（GDScript + 场景），每玩家一个 SubViewport 独立渲染/捕获帧，接收反向输入（经 `NetworkInputRouter` → `PlayerInput` 分发给各玩家） |
-| `src/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送；`godot_process.*` 负责启动/重启 Godot 子进程 |
-| `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 + 用户槽位自动分配 |
-| `html/` | 浏览器前端（WebRTC 接收端）+ nginx 配置 |
+| `src/` | C++17 发送端（分模块）：`app`(入口/编排) `config`(运行时配置) `core`(会话/共享内存协议) `capture`(Godot 子进程) `transport`(Godot TCP 通道) `encode`(GStreamer 管线) `signalling`(信令 WS 客户端) **`http`(内置 HTTP/静态资源/TLS，替代 nginx)** `util`(全局状态) |
+| `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 + 用户槽位自动分配（**待并入 `src/`**） |
+| `html/` | 浏览器前端静态资源（WebRTC 接收端）+ 旧 nginx 配置 |
 | `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot（旧的手动启动方式，现可由 C++ 自动启动替代） |
 | `docs/` | 设计文档，含 [多用户+多 GPU 架构](docs/multi-user-multi-gpu-design.md) 与 [GPU 零拷贝分析](docs/gpu-zero-copy-design.md) |
 
@@ -58,19 +58,22 @@ cd ../..
 
 ### 方式 A：C++ 自动编排（推荐）
 
-`config.json` 中设 `godot.launch = true`，则由 `webrtc_sender` 自动启动 Godot 子进程，
-只需手动启动信令服务器、nginx、sender 三件套：
+`config.json` 中设 `godot.launch = true`，则由 `webrtc_sender` 自动启动 Godot 子进程。
+内置 HTTP 服务也随 sender 一起启动，因此**只需两个进程**（信令 + sender）：
 
 ```bash
-# 1) 信令服务器
+# 1) 信令服务器（回环 9443）
 cd signalling-server && node server.js
 
-# 2) nginx
-nginx -c "$(pwd)/html/nginx.conf"
-
-# 3) sender（会自动 fork/exec 启动 Godot，并注入 NVIDIA PRIME 环境变量）
+# 2) sender（自动 fork/exec 启动 Godot、注入 PRIME 环境变量、并在 8443 提供前端页面）
 ./build/webrtc_sender                        # 从仓库根目录运行（会读到 ./config.json）
+
+# 3)（当前阶段需要）nginx —— 因为 8443 的 /ws 尚未接入，完整会话仍走 8444
+nginx -c "$(pwd)/html/nginx.conf"
 ```
+
+> 待信令合并进 `src/` 后，第 1、3 步都会消失：只跑 `./build/webrtc_sender`，
+> 浏览器直接访问 `https://127.0.0.1:8443/`。
 
 - Godot 子进程由 sender 监控，崩溃后自动指数退避重启（`1s→2s→…→30s`）。
 - sender 退出时会向 Godot 发 SIGTERM 优雅关停。
@@ -87,24 +90,41 @@ nginx -c "$(pwd)/html/nginx.conf"
 
 ---
 
-### 第 1 步：信令服务器（wss://0.0.0.0:8443）
+### 第 1 步：信令服务器（wss://127.0.0.1:9443）
 
 ```bash
 cd signalling-server && node server.js
 ```
-日志出现 `Signalling server listening on wss://0.0.0.0:8443` 即为成功。
-（Node 端实际读取的是 `config.json` 中的默认端口/证书路径；改端口可设环境变量 `PORT`。）
+日志出现 `Signalling server listening on wss://127.0.0.1:9443` 即为成功。
+（端口/绑定地址读自 `config.json` 的 `signalling_server`，改端口可设环境变量 `PORT`。）
 
-### 第 2 步：nginx 前端（HTTP 8080 → HTTPS 8444，代理 /ws）
+> **端口变更说明**：信令服务原先占 `8443` 并监听 `0.0.0.0`；该端口现已让给内置的
+> C++ HTTP 服务（见第 2 步），信令迁到**回环 `9443`**——顺带消除了它对外直接暴露的问题。
+
+### 第 2 步：前端入口（两种，可并存）
+
+**方式 1（新）：由 sender 内置的 C++ HTTP 服务提供 —— 端口 8443**
+
+随第 4 步的 `webrtc_sender` 一起启动，无需额外进程：
+
+- `https://<ip>:8443/` 提供浏览器页面（`test.html`，从 `config.json` 的 `http.web_root` 读取）
+- `https://<ip>:8443/config.json` 提供**白名单裁剪后**的公开配置（仅 `concurrency.max_users`），
+  不再像原先 nginx 那样把整份 `config.json`（含绝对路径、证书路径）暴露给访客
+- `https://<ip>:8443/ws` **尚未实现**（信令合并进行中，当前返回 `501`）
+
+**方式 2（旧，仍可用）：nginx —— HTTP 8080 → HTTPS 8444**
 
 ```bash
 nginx -c "$(pwd)/html/nginx.conf"
 ```
 - `http://<ip>:8080/` → `301` 重定向到 `https://<ip>:8444/`
 - `https://<ip>:8444/` 提供浏览器页面（`test.html`）
-- `https://<ip>:8444/ws` 反向代理到信令服务器 `https://127.0.0.1:8443`
+- `https://<ip>:8444/ws` 反向代理到信令服务器 `https://127.0.0.1:9443`
 
 用 `nginx -t -c <conf>` 校验配置语法；用 `nginx -s reload -c <conf>` 重载。
+
+> **当前阶段（信令合并未完成）**：完整会话请走 **方式 2**（`8444`），因为 `8443` 的 `/ws`
+> 尚未接入。方式 1 目前可用于验证静态资源与公开配置。
 
 ### 第 3 步：Godot（创建共享内存帧）
 
@@ -114,7 +134,7 @@ nginx -c "$(pwd)/html/nginx.conf"
 每个 Godot 实例渲染 `players_per_gpu` 个玩家（每个玩家一个 SubViewport），
 写入 `/dev/shm/godot_webrtc_frame_<u>`（`u` 为全局用户索引，多 GPU 时为 `gpu*players_per_gpu+k`）。
 
-### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC）
+### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC + 内置 HTTP 服务）
 
 ```bash
 cd <仓库根目录> && ./build/webrtc_sender
@@ -122,11 +142,13 @@ cd <仓库根目录> && ./build/webrtc_sender
 - 按 `max_users` 启动对应数量的 GStreamer 管线与 shm 读取线程（零拷贝）
 - 按 GPU 启动 TCP 控制通道（端口 `tcp_port_base + gpu`），接收输入并带 `player` 索引转发
 - 每用户一对信令 id：`sender_<u>` ↔ `viewer_<u>`
+- **同时启动内置 HTTP(S) 服务**（默认 8443，见第 2 步方式 1）
 
 ### 第 5 步：浏览器（WebRTC 接收端）
 
-用浏览器打开 `https://127.0.0.1:8444/`（**无需任何 URL 参数**）。信令服务器会
-自动分配一个空闲用户槽位；当所有槽位已满时，页面显示"无法接入会话"错误页。
+用浏览器打开 `https://127.0.0.1:8444/`（方式 2）或 `https://127.0.0.1:8443/`（方式 1，
+需等 `/ws` 合并完成）。信令服务器会自动分配一个空闲用户槽位；
+当所有槽位已满时，页面显示"无法接入会话"错误页。
 
 ---
 
@@ -150,10 +172,14 @@ cd <仓库根目录> && ./build/webrtc_sender
 
 | 端口 | 服务 | 作用 |
 |------|------|------|
-| 8080 | nginx | HTTP，`301` 重定向到 8444 |
-| 8444 | nginx (HTTPS) | 浏览器前端页面 |
-| 8443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 / 用户槽位分配 |
+| **8443** | **webrtc_sender 内置 HTTP(S)** | **浏览器前端页面 + `/config.json`（公开白名单）**；`/ws` 待合并完成后接入 |
+| 9443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 / 用户槽位分配（**回环地址**，仅本机可达） |
+| 8444 | nginx (HTTPS) | 旧入口：浏览器前端页面（与 8443 可并存对照） |
+| 8080 | nginx | 旧入口：HTTP，`301` 重定向到 8444 |
 | 9002 + gpu | webrtc_sender (TCP) | 每 GPU 一条，接收该 GPU 的 Godot 控制输入通道（单 GPU 为 9002） |
+
+> 迁移目标：信令并入 `webrtc_sender` 后，`8443` 将成为**唯一对外端口**，
+> nginx(8080/8444) 与 Node(9443) 一并退场——届时只需分发起一个可执行文件 + `config.json`。
 
 共享内存：`/dev/shm/godot_webrtc_frame_<u>`，每个用户一个文件（零拷贝帧传输，
 1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。`u` 为全局用户索引，多 GPU 时为
@@ -247,12 +273,48 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 
 - `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `src/config/config.cpp`）。
   可用 `--config <path>` 显式指定；默认依次查找当前目录及上级目录的 `config.json`。
-- `html/script.js`：页面启动时 `fetch('/config.json')` 读取（nginx 在 `/config.json` 暴露它，
-  见 `html/nginx.conf`）。
+- `html/script.js`：页面启动时 `fetch('config.json')` 读取。**注意**：内置 C++ HTTP 服务
+  （8443）只返回白名单字段，而旧 nginx 入口（8444）仍会把整份 `config.json` 暴露出去——
+  这是要继续修的问题（方案文档 W-06）。
 - `signalling-server/server.js`：启动时读取 `config.json`。
 - `Godot/test/main.gd`：启动时读取 `config.json`。
 
 因此修改 `config.json` 后只需重启对应进程（浏览器需刷新页面），**无需重新编译**。
+
+### `http` 段与敏感字段的环境变量注入
+
+新增的 `http` 段控制内置 HTTP 服务（P2 替代 nginx）：
+
+```json
+"http": {
+  "listen_host": "0.0.0.0",     // 监听地址
+  "port": 8443,                 // 对外端口（信令合并后将成为唯一入口）
+  "web_root": "html",           // 前端静态资源目录（按启动目录解析）
+  "tls_cert_path": ".../dev-cert.pem",
+  "tls_key_path": ""            // 可留空，由环境变量注入
+}
+```
+
+敏感/机器相关字段支持**环境变量覆盖，优先级高于 `config.json`**，便于容器/CI 部署时
+不把私密路径写进配置文件：
+
+| 环境变量 | 覆盖字段 |
+|---|---|
+| `CLOUDVR_TLS_KEY` | `http.tls_key_path`（**私钥路径，推荐用这个注入**） |
+| `CLOUDVR_TLS_CERT` | `http.tls_cert_path` |
+| `CLOUDVR_HTTP_PORT` | `http.port`（非法值会被忽略并告警） |
+| `CLOUDVR_HTTP_HOST` | `http.listen_host` |
+| `CLOUDVR_WEB_ROOT` | `http.web_root` |
+
+示例：
+
+```bash
+CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
+# 启动日志会打印：config: 环境变量覆盖了 1 个字段
+```
+
+未设置环境变量时行为不变；若证书或私钥缺失，HTTP 服务会**拒绝启动并给出明确原因**
+（而不是静默降级为明文 HTTP），视频链路不受影响。
 
 > 注意：`config.json` 中的 `nginx.server_name` 与 `html/nginx.conf` 中的 `server_name`
 > 已统一改为 `127.0.0.1`（原域名为 `ar.myc.wiki`，已过期）。浏览器即通过该 IP 访问。

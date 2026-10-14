@@ -9,6 +9,7 @@
 #include "config/config.h"
 #include "capture/godot_process.h"
 #include "encode/pipeline.h"
+#include "http/http_server.h"
 #include "signalling/signalling.h"
 #include "transport/tcp_server.h"
 
@@ -47,6 +48,13 @@ int main(int argc, char *argv[]) {
               << "fps, signalling=" << g_config.signalling_url << std::endl;
   } else {
     std::cout << "No valid config.json, using built-in defaults" << std::endl;
+  }
+
+  // ---- 环境变量覆盖（优先级高于 config.json）----
+  // 敏感字段（TLS 私钥等）与机器相关路径建议用环境变量注入，
+  // 这样 config.json 里可以不放任何私密信息。
+  if (const int overridden = apply_env_overrides(g_config); overridden > 0) {
+    std::cout << "config: 环境变量覆盖了 " << overridden << " 个字段" << std::endl;
   }
 
   // ---- P1：并发/拓扑强校验（失败即拒绝启动，防资源不足/配置漂移）----
@@ -88,6 +96,12 @@ int main(int argc, char *argv[]) {
     gpu_tcp(g).tcp_port = g_config.tcp_port_base + g;
   }
 
+  // ---- 启动内置 HTTP(S) 服务（P2：替代 nginx）----
+  // 失败不阻断视频链路（信令/编码与 Web 服务相互独立），仅打印明确原因。
+  if (!start_http_server()) {
+    std::cerr << "警告: 内置 HTTP 服务未启动；页面/配置请暂用 nginx 入口" << std::endl;
+  }
+
   // ---- 启动 Godot 子进程（若 godot.launch=true）----
   // 先启动 Godot，让它有时间创建 shm 帧文件；后续 shm 读取线程会自动等待。
   start_godot_processes();
@@ -110,6 +124,7 @@ int main(int argc, char *argv[]) {
 
   // ---- 逐 GPU / 逐用户清理 ----
   // 先关停 Godot 子进程（停止写帧），再清理读取端
+  stop_http_server();
   stop_godot_processes();
   for (int g = 0; g < g_config.gpu_count; ++g) {
     stop_godot_tcp_server(g);
