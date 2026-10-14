@@ -379,6 +379,36 @@ cmake -B build-tsan -DENABLE_TSAN=ON     # ThreadSanitizer
 版本不满足会直接报错而不是留到运行期。
 `build/compile_commands.json` 可供 clangd / IDE 索引使用。
 
+## 测试
+
+目前有信令服务端的协议级回归测试（内置信令是浏览器拿流的必经路径，且历史上
+踩过若干静默失败的坑，因此优先为它建立回归）：
+
+```bash
+# 1) 先启动 sender（它就是被测服务）
+./build/webrtc_sender
+
+# 2) 另开一个终端运行测试
+python3 tests/test_signalling.py
+```
+
+脚本会从**仓库根的 `config.json`** 读取 `http.port` 与 `concurrency.max_users`，
+而不是写死端口——这样「配置与实际不符」这类问题（例如 `signalling_url` 指错端口
+导致 sender 未注册、浏览器拿不到流）会被测试直接暴露。
+
+覆盖内容：
+
+| 类别 | 用例 |
+|---|---|
+| 前置 | 服务可达、`sender_0` 已注册（未注册会给出排查提示） |
+| 正向 | ASSIGN 槽位分配、SESSION 配对、PING/PONG、**完整协商流程**（reset → 收到 offer） |
+| 负向 | N-01 id 劫持、N-02 跨用户配对、N-03 超长帧、S-01 跨站 Origin、槽位耗尽 |
+| 崩溃回归 | SDP glare（远端 offer）与字段缺失消息不得打死 sender |
+
+服务未启动时脚本会直接中止并提示（退出码 2）；用例失败退出码为 1。
+
+依赖：`python-websockets`（`pacman -S python-websockets`）。
+
 ## 常见问题排查
 
 | 现象 | 原因 / 解决 |

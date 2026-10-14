@@ -637,7 +637,8 @@ CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
    返回 NULL，依赖它会**静默放行所有来源**（实测 `Origin: https://evil.example` 也能连上）。
 3. **TLS 必须显式传 `SOUP_SERVER_LISTEN_HTTPS`**（见 4.4）。
 
-**验证（`/tmp/sigtest.py`，15/15 通过）**
+**验证（`tests/test_signalling.py`，20/20 通过；脚本从真实 `config.json` 读取端口
+与 `max_users`，因此配置漂移也能被它抓到）**
 
 - 正向：ASSIGN→`ASSIGNED 0`；SESSION→`SESSION_OK`；PING→PONG
 - 中继双向：viewer 发 `{"reset":true}` → **0.35s 后收到 sender 的 SDP offer**；
@@ -743,6 +744,8 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 │   ├── signalling/signalling.cpp / .h   # 信令 WebSocket 客户端（按 u 隔离；合并后删除）
 │   ├── http/http_server.cpp / .h        # 内置 HTTP(S)：静态资源 + 公开配置 + TLS（替代 nginx）
 │   └── util/common.cpp / .h             # 全局状态 + g_sessions/g_gpu_tcp
+├── tests/
+│   └── test_signalling.py               # 内置信令服务端协议级回归测试
 ├── signalling-server/
 │   ├── server.js                        # 纯 Node.js 信令服务器 + 槽位自动分配
 │   └── certs/                           # TLS 证书
