@@ -1,4 +1,4 @@
-#include "tcp_server.h"
+#include "transport/tcp_server.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -14,8 +14,8 @@
 #include <thread>
 #include <unistd.h>
 
-#include "common.h"
-#include "pipeline.h"
+#include "util/common.h"
+#include "encode/pipeline.h"
 
 // ======================== 内部工具 ========================
 

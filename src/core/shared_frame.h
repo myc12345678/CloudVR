@@ -1,7 +1,7 @@
 #ifndef SHARED_FRAME_H
 #define SHARED_FRAME_H
 
-#include "config.h"
+#include "config/config.h"
 
 #include <atomic>
 #include <cstddef>

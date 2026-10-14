@@ -52,15 +52,19 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
 find_package(Threads REQUIRED)
 
 # ---- 可执行文件 ----
-# 用 GLOB + CONFIGURE_DEPENDS 取代原 Makefile 手工维护的 SRCS 列表，
-# 避免新增 .cpp 后忘记登记导致"改了没生效"（`*.cpp` 不会匹配 `#common.cpp#` 之类）。
-file(GLOB SENDER_SOURCES CONFIGURE_DEPENDS
-  "${CMAKE_CURRENT_SOURCE_DIR}/Gstreamer/*.cpp")
+# 源码按模块组织在 src/ 下（app/config/core/util/capture/transport/encode/signalling），
+# 以 src/ 为唯一的头文件搜索根，因此 include 一律写成模块限定路径，
+# 例如 #include "config/config.h"、"core/session.h"。
+#
+# 用 GLOB_RECURSE + CONFIGURE_DEPENDS 取代原 Makefile 手工维护的 SRCS 列表，
+# 避免新增 .cpp 后忘记登记导致"改了没生效"。
+file(GLOB_RECURSE SENDER_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 add_executable(webrtc_sender ${SENDER_SOURCES})
 
 target_include_directories(webrtc_sender PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/Gstreamer")
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 target_compile_options(webrtc_sender PRIVATE -Wall -Wextra)
 

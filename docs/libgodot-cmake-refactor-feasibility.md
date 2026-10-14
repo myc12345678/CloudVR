@@ -48,17 +48,17 @@
 
 | # | 耦合点 | 位置 | libgodot 下是否消失 |
 |---|---|---|---|
-| 1 | 子进程 `fork/exec` 与 `--dsh-gpu/--dsh-players` 用户参数 | `Gstreamer/godot_process.cpp:47-80`；`Godot/test/main.gd:81-91` | 参数可改为 `argv` 直传；进程管理改为实例生命周期 |
-| 2 | 每 GPU 一条 TCP 控制通道 + 私有协议 | `Gstreamer/tcp_server.cpp`；`main.gd:386-423` | 可去掉（改为 GDExtension 直接调用） |
+| 1 | 子进程 `fork/exec` 与 `--dsh-gpu/--dsh-players` 用户参数 | `src/capture/godot_process.cpp:47-80`；`Godot/test/main.gd:81-91` | 参数可改为 `argv` 直传；进程管理改为实例生命周期 |
+| 2 | 每 GPU 一条 TCP 控制通道 + 私有协议 | `src/transport/tcp_server.cpp`；`main.gd:386-423` | 可去掉（改为 GDExtension 直接调用） |
 | 3 | 共享内存路径模板 `/dev/shm/godot_webrtc_frame_{index}` | `config.json:56-59`；`main.gd:156-158` | 可去掉（改为进程内环形缓冲） |
-| 4 | 16 字节头 + RGB8 布局（写/读握手协议） | `Gstreamer/shared_frame.h:41-53`；`main.gd:304-318` | 可去掉 |
-| 5 | shm 轮询读线程（3ms 休眠 + inode 重建检测 + ready 自旋） | `Gstreamer/tcp_server.cpp:225-326` | 可去掉 |
-| 6 | 帧拷贝：`gst_buffer_new_allocate` + `gst_buffer_fill` | `Gstreamer/pipeline.cpp:11-37` | 可用 `gst_buffer_new_wrapped` 消除 |
+| 4 | 16 字节头 + RGB8 布局（写/读握手协议） | `src/core/shared_frame.h:41-53`；`main.gd:304-318` | 可去掉 |
+| 5 | shm 轮询读线程（3ms 休眠 + inode 重建检测 + ready 自旋） | `src/transport/tcp_server.cpp:225-326` | 可去掉 |
+| 6 | 帧拷贝：`gst_buffer_new_allocate` + `gst_buffer_fill` | `src/encode/pipeline.cpp:11-37` | 可用 `gst_buffer_new_wrapped` 消除 |
 | 7 | 崩溃退避重启 `1s→…→30s` | `godot_process.cpp:101-116` | ❌ **无法等价实现**（见 §3.4） |
 | 8 | SIGTERM/SIGKILL 关停 + `g_child_watch_add` 回收 | `godot_process.cpp:121-201` | 改为 `stop()` / `destroy` |
 | 9 | PRIME 环境变量注入（独显强制） | `godot_process.cpp:36-44` | ⚠️ 变差（进程级全局，见 §3.5） |
 | 10 | Godot 需要**真实窗口**（`get_window().set_size`、`DisplayServer.window_set_vsync_mode`） | `Godot/test/main.gd:47-52` | ⚠️ 仍需 DisplayServer，非 headless |
-| 11 | `config.json` 的 `godot.*` 配置段 | `Gstreamer/config.h:36-39`；`config.json:14-22` | 部分字段语义变化 |
+| 11 | `config.json` 的 `godot.*` 配置段 | `src/config/config.h:36-39`；`config.json:14-22` | 部分字段语义变化 |
 | 12 | `addons/webrtc` GDExtension（`extension_list.cfg` 自动加载，但 GDScript 未实际使用） | `Godot/test/.godot/extension_list.cfg` | 兼容；**建议移除**以降低风险 |
 
 > 关键观察：**项目现有帧通路完全不依赖 GDExtension**（纯 GDScript + `FileAccess`），GDExtension 能力尚未被使用。这既是 libgodot 改造可以"只换壳"的有利条件，也说明现在没有现成的宿主扩展可复用。

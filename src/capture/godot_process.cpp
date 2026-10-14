@@ -1,4 +1,4 @@
-#include "godot_process.h"
+#include "capture/godot_process.h"
 
 #include <array>
 #include <cerrno>
@@ -9,7 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "common.h"
+#include "util/common.h"
 
 // ======================== Godot 子进程编排 ========================
 

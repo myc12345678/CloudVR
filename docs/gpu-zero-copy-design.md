@@ -1,7 +1,7 @@
 # Godot → GStreamer 显存直读（GPU 零拷贝）设计文档
 
 > 状态：**可行性分析稿（已核对本机 GStreamer 插件 + Godot 4.7.2 extension API + Godot 源码），尚未实施，未改任何代码。**
-> 适用范围：`Gstreamer/` 发送端 + `Godot/test/` 游戏端。
+> 适用范围：`src/` 发送端 + `Godot/test/` 游戏端。
 > 结论先行：**GStreamer 侧可行（本机已实测插件 caps）；真正的 blocker 在 Godot 侧——stock Godot 4.7.2 的 Vulkan 设备未启用 `VK_EXT_external_memory_dma_buf`，因此导不出 GStreamer 能导入的 dma-buf fd。该缺口需要一个很小的引擎补丁（fork + 重编译 Godot），补丁后可行，且存在比"自己 blit"更干净的实现路线。**
 
 ---
@@ -34,10 +34,10 @@ SubViewport 离线渲染 → GPU 显存
 
 | 环节 | 文件 |
 |------|------|
-| 共享内存布局 | `Gstreamer/shared_frame.h`、`Godot/test/main.gd` `_send_frame_via_shm()` |
+| 共享内存布局 | `src/core/shared_frame.h`、`Godot/test/main.gd` `_send_frame_via_shm()` |
 | Godot 回读 + 写帧 | `Godot/test/main.gd` `send_frame()` / `_send_frame_via_shm()` |
-| GStreamer 读帧线程 | `Gstreamer/tcp_server.cpp` `shm_reader_loop()` |
-| 管线描述 | `Gstreamer/pipeline.cpp` `build_pipeline_desc()`、`config.cpp`（运行时从 `config.json` 读取配置） |
+| GStreamer 读帧线程 | `src/transport/tcp_server.cpp` `shm_reader_loop()` |
+| 管线描述 | `src/encode/pipeline.cpp` `build_pipeline_desc()`、`config.cpp`（运行时从 `config.json` 读取配置） |
 
 ---
 
@@ -290,11 +290,11 @@ SHM 那套"写最后一帧、读者拿最新"在 GPU 上**不成立**：Godot �
 |------|------|
 | Godot 引擎源码 `drivers/vulkan/rendering_device_driver_vulkan.cpp` | 扩展注册列表追加 `VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME`（可选 external_semaphore/fence），重编译引擎 |
 | 新增 `Godot/test/addons/gpu_export/`（GDExtension） | 自建 exportable 图（raw Vulkan）+ `texture_create_from_extension` 导回 + `texture_copy` + `vkGetMemoryFdKHR` 导出 + setup 传 fd |
-| `Gstreamer/pipeline.cpp` | 管线从 `cudaupload+cudaconvert` 换为 `glupload+glcolorconvert`，appsrc caps 改 `memory:DMABuf,format=DMA_DRM,drm-format=...` |
-| `Gstreamer/tcp_server.cpp` `shm_reader_loop()` | 从读像素改为读 `buffer_index` → 导入 GPU 帧 → `push_gpu_frame`；编码完成后写回 released |
-| `Gstreamer/shared_frame.h` | 扩展：增加 `buffer_index` 字段（或复用头部 padding），定义环形/released 语义 |
-| `Gstreamer/config.cpp` / `config.h`（运行时读取） | 增加 dma-buf / 缓冲 N 等配置项 |
-| `Gstreamer/main.cpp` | 增加 fd 接收（SCM_RIGHTS unix socket）初始化 |
+| `src/encode/pipeline.cpp` | 管线从 `cudaupload+cudaconvert` 换为 `glupload+glcolorconvert`，appsrc caps 改 `memory:DMABuf,format=DMA_DRM,drm-format=...` |
+| `src/transport/tcp_server.cpp` `shm_reader_loop()` | 从读像素改为读 `buffer_index` → 导入 GPU 帧 → `push_gpu_frame`；编码完成后写回 released |
+| `src/core/shared_frame.h` | 扩展：增加 `buffer_index` 字段（或复用头部 padding），定义环形/released 语义 |
+| `src/config/config.cpp` / `config.h`（运行时读取） | 增加 dma-buf / 缓冲 N 等配置项 |
+| `src/app/main.cpp` | 增加 fd 接收（SCM_RIGHTS unix socket）初始化 |
 | `Godot/test/main.gd` | `send_frame()` 改为：渲染→`texture_copy`→写 `buffer_index`/`write_counter`；`_send_frame_via_shm` 调整（或走 C+ 异步读回） |
 | `config.json`（运行时读取） | 增加相关配置项（各子系统启动时读取） |
 | 文档 | 本文件 + README/TECHNICAL 更新 |

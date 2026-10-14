@@ -1,7 +1,7 @@
 # 多用户 + 多 GPU 架构设计文档
 
 > 状态：**已部分实施。单卡多用户（P1~P3）与 C++ 编排 Godot 子进程（P4 前置）已完成；多 GPU 编码绑定、多卡编排（P4 完整）、WSL2 双卡测试（P5）、原生 Linux 多卡验证（P6）尚未实施。** 各阶段实现状态见 §7。
-> 适用范围：`Gstreamer/` 发送端、`Godot/test/` 游戏端、`signalling-server/` 信令、`html/` 浏览器前端。
+> 适用范围：`src/` 发送端、`Godot/test/` 游戏端、`signalling-server/` 信令、`html/` 浏览器前端。
 > 目标：把当前"1 发送端 ↔ 1 浏览器"的单用户点对点系统，改造为"多个用户、每个用户一个 Godot 玩家实例、多 GPU 上并行渲染+编码"的系统。
 > 结论先行：**改造核心是把整条全链路单例（SubViewport/shm/sender/pipeline/ws_conn/输入）用一个用户索引 `u` 参数化；Godot 因单进程只能用一张卡而采用"每 GPU 一个 Godot 实例"，由 C++ sender 统一启动与编排；并发上限由唯一配置源 `config.json` 的 `topology` 强校验决定。**
 
@@ -25,8 +25,8 @@ Player ─ Camera3D ─ SubViewport(单)            webrtcbin(单) ─ appsrc(�
 | 层 | 证据（文件：行） | 含义 |
 |---|---|---|
 | 配置 | `config.json` `gstreamer.self_id="cpp_sender"`、`peer_id="browser"` | 只有一对固定对端 |
-| sender | `Gstreamer/signalling.cpp` 只 `SESSION peer_id` 一次、`session_started` 单会话标志 | 只与一个浏览器建会话 |
-| sender 管线 | `Gstreamer/pipeline.cpp` `build_pipeline_desc()` 单个 `webrtcbin`/`appsrc` | 只产一路流 |
+| sender | `src/signalling/signalling.cpp` 只 `SESSION peer_id` 一次、`session_started` 单会话标志 | 只与一个浏览器建会话 |
+| sender 管线 | `src/encode/pipeline.cpp` `build_pipeline_desc()` 单个 `webrtcbin`/`appsrc` | 只产一路流 |
 | 浏览器 | `html/script.js:5` `selfId='browser'`、`peerId='cpp_sender'` | 唯一观看端 |
 | 信令 | `signalling-server/server.js:36` `clients = new Map()`；`HELLO` 时 `clients.set(id, state)` | 同 id 只有一条连接，后连覆盖先连 |
 
@@ -191,13 +191,13 @@ signalling server（Map<id,conn>，校验 total_users 上限 + 自动分配 view
 > 实现状态：P2/P3 已完成下述大部分改造；**尚未实现**每管线 CUDA 设备绑定
 > （`cuda-device-id = gpu(u)`，见 pipeline 小节）。
 
-**`Gstreamer/config.h` / `config.cpp`** ✅ 已实现（P1）
+**`src/config/config.h` / `config.cpp`** ✅ 已实现（P1）
 - `Config` 增加：`int max_users`、`int gpu_count`、`int players_per_gpu`、`int tcp_port_base`、`std::string shm_path_template`、`std::string sender_id_template`、`std::string viewer_id_template`、`std::string godot_project_path`。
 - 删除 `self_id`/`peer_id`/`godot_tcp_port`/`shm_path` 单值。
 - `config.cpp` 解析 `topology`/`concurrency`/`godot`/`gstreamer.id_template`/`shm.path_template`。
 - 加载后对每个 `u` 展开模板（`{index}` → 数字）得到 `shm_path[u]`、`sender_id[u]`、`viewer_id[u]`、`tcp_port[u]`。
 
-**新增 `Gstreamer/session.h`（关键数据结构）** ✅ 已实现（P2）
+**新增 `src/core/session.h`（关键数据结构）** ✅ 已实现（P2）
 
 ```cpp
 struct UserSession {
@@ -229,16 +229,16 @@ extern std::array<UserSession, MAX_USERS_HARD> g_sessions;
 > `GpuTcpState`（`std::array<GpuTcpState, MAX_USERS_HARD> g_gpu_tcp`），因为 TCP
 > 通道按 GPU 而非用户维度管理（见下）。
 
-**`Gstreamer/common.h` / `common.cpp`** ✅ 已实现（P2）
+**`src/util/common.h` / `common.cpp`** ✅ 已实现（P2）
 - 删除单例全局（`pipeline/webrtcbin/appsrc/ws_conn/self_id/peer_id/session_started/bus_watch_id/shm_*/tcp_*`）。
 - 只保留 `loop`、`shutting_down`、`now_ms()`、`soup_session`，其余迁入 `g_sessions[u]` / `g_gpu_tcp[g]`。
 
-**`Gstreamer/pipeline.cpp`** 🔶 已实现大部分（P2）
+**`src/encode/pipeline.cpp`** 🔶 已实现大部分（P2）
 - `build_pipeline_desc(u)`：给每个用户命名唯一 element 名（`webrtc0/godotsrc0`、`webrtc1/godotsrc1`…）。✅
 - 给 CUDA 元素设 **`cuda-device-id = gpu(u)`**：⬜ **尚未实现**（多 GPU 编码绑定，P4 待做）。
 - `start_pipeline(u)/stop_pipeline(u)`、`maybe_reset_pipeline(u)`、`push_raw_frame_to_appsrc(u, ...)` 全部按 `u` 操作。✅
 
-**`Gstreamer/signalling.cpp`** ✅ 已实现（P2/P3）
+**`src/signalling/signalling.cpp`** ✅ 已实现（P2/P3）
 - 所有信号回调以 `u` 作为 `user_data`（`GINT_TO_POINTER(u)`）。✅
 - `connect_webrtc_signals(GstElement*, int u)`。✅
 - 每用户独立 `SoupWebsocketConnection`（共用 `SoupSession`）。✅
@@ -246,12 +246,12 @@ extern std::array<UserSession, MAX_USERS_HARD> g_sessions;
 - `reset` 消息只重置该用户管线。✅
 - 重连退避状态按用户各自持有。✅
 
-**`Gstreamer/tcp_server.cpp`** ✅ 已实现（P3）
+**`src/transport/tcp_server.cpp`** ✅ 已实现（P3）
 - 每 GPU 一条 TCP（端口 `tcp_port_base + g`），`GpuTcpState` 数组。✅
 - 输入按 `u` 映射 `(g, local_player)`，封装 `{"player": local_player, ...}`。✅
 - `send_to_godot(g, player, ...)` 各自独立 fd + mutex。✅
 
-**`Gstreamer/main.cpp`** ✅ 已实现（P1/P3/P4前置）
+**`src/app/main.cpp`** ✅ 已实现（P1/P3/P4前置）
 - 校验 `max_users`（范围 + 拓扑一致性）。✅
 - 启动 Godot 子进程（`godot_process.cpp`，`godot.launch=true` 时）。✅
 - 循环 `u` 启动管线/shm/信令；按 GPU 启动 TCP。✅

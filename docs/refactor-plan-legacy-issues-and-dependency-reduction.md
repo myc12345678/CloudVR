@@ -68,7 +68,7 @@
 
 | 组件 | 状态 | 实测证据 |
 |---|---|---|
-| 构建产物 | ✅ | `Gstreamer/webrtc_sender`（116 KB）存在 |
+| 构建产物 | ✅ | `build/webrtc_sender`（116 KB）存在 |
 | config.json 加载 | ✅ | `config.json loaded (runtime) -> 1920x1080@60fps` |
 | 拓扑强校验 | ✅ | `topology: gpu_count=1 players_per_gpu=3 max_users=3` |
 | Godot 子进程拉起 | ✅ | `godot_process: started Godot for gpu=0 pid=…` |
@@ -114,13 +114,13 @@
 
 | 编号 | 标题 | 证据 | 验证 | 影响 | 修复建议 |
 |---|---|---|---|---|---|
-| **L-01** | ~~**NVENC 硬件编码路径引用已不存在/未注册的元素 `cudaconvert`，导致硬件管线无法构建**~~ **✅ 已修复（2026-10-14）** | 原位置 `Gstreamer/pipeline.cpp:138`（硬编码 `cudaupload ! cudaconvert ! …`），已移除并补正注释 | ✅ **实测**：修复前 `gst-launch … cudaupload ! cudaconvert ! …` → `错误管道: 无组件"cudaconvert"`；实跑 sender 时 `Pipeline create failed: no element "cudaconvert"` × 3。**修复后（默认 `nvenc` 配置）**：`Pipeline create failed: 0`、`Pushed raw frame: 62`、3× `HELLO_OK`，且信令侧产出带真实 SPS/PPS 的 H.264 offer（`sprop-parameter-sets=Z0LAKpWQB4AiflwFqAgICgAAB9AAA6mBCA==,aMuPIA==`, `profile-level-id=42c02a`） | 原影响：`encoding.type=nvenc`（`config.json:47`）时 `gst_parse_launch` 失败 → **NVENC 路径整体不可用**，仅软件 VP8 可跑 | ~~移除 `cudaconvert`~~ **已执行**。补充事实：该元素属 CUDA filter 家族，Arch 打包的 `gst-plugins-bad-libs` **从未注册**它（`cudaconvert`/`cudaconvertscale` 在 1.28.7 与 1.28.8 中均不可用），且编码器 sink caps 本就接受 `{NV12,Y444,VUYA,RGBA,RGBx,BGRA,BGRx}`，协商时 `videoconvert` 已按首选输出 NV12 → 该元素只会空转 |
-| **L-02** | **硬编码公网 STUN 服务器（两端各一处）** | 服务端 `Gstreamer/pipeline.cpp:121`（`stun-server=stun://stun.l.google.com:19302`）；**前端** `html/script.js:343-345`（`iceServers` 硬编码同一地址） | ✅ 实测可解析到 `2001:4860:4864:5:8000::1` | 引入**外网依赖**（离线/内网部署失败、DNS 依赖、元数据外泄），与"减少外部依赖"目标直接冲突；且无 TURN，跨 NAT 本就不通 | 两端 STUN 均改为 `config.json` 的 `iceServers` 可配项，内网默认置空（host 候选足够） |
+| **L-01** | ~~**NVENC 硬件编码路径引用已不存在/未注册的元素 `cudaconvert`，导致硬件管线无法构建**~~ **✅ 已修复（2026-10-14）** | 原位置 `src/encode/pipeline.cpp:138`（硬编码 `cudaupload ! cudaconvert ! …`），已移除并补正注释 | ✅ **实测**：修复前 `gst-launch … cudaupload ! cudaconvert ! …` → `错误管道: 无组件"cudaconvert"`；实跑 sender 时 `Pipeline create failed: no element "cudaconvert"` × 3。**修复后（默认 `nvenc` 配置）**：`Pipeline create failed: 0`、`Pushed raw frame: 62`、3× `HELLO_OK`，且信令侧产出带真实 SPS/PPS 的 H.264 offer（`sprop-parameter-sets=Z0LAKpWQB4AiflwFqAgICgAAB9AAA6mBCA==,aMuPIA==`, `profile-level-id=42c02a`） | 原影响：`encoding.type=nvenc`（`config.json:47`）时 `gst_parse_launch` 失败 → **NVENC 路径整体不可用**，仅软件 VP8 可跑 | ~~移除 `cudaconvert`~~ **已执行**。补充事实：该元素属 CUDA filter 家族，Arch 打包的 `gst-plugins-bad-libs` **从未注册**它（`cudaconvert`/`cudaconvertscale` 在 1.28.7 与 1.28.8 中均不可用），且编码器 sink caps 本就接受 `{NV12,Y444,VUYA,RGBA,RGBx,BGRA,BGRx}`，协商时 `videoconvert` 已按首选输出 NV12 → 该元素只会空转 |
+| **L-02** | **硬编码公网 STUN 服务器（两端各一处）** | 服务端 `src/encode/pipeline.cpp:121`（`stun-server=stun://stun.l.google.com:19302`）；**前端** `html/script.js:343-345`（`iceServers` 硬编码同一地址） | ✅ 实测可解析到 `2001:4860:4864:5:8000::1` | 引入**外网依赖**（离线/内网部署失败、DNS 依赖、元数据外泄），与"减少外部依赖"目标直接冲突；且无 TURN，跨 NAT 本就不通 | 两端 STUN 均改为 `config.json` 的 `iceServers` 可配项，内网默认置空（host 候选足够） |
 | **L-03** | 每管线 CUDA 设备绑定未实现 | `docs/multi-user-multi-gpu-design.md:238,320-321` | 文档自述 | nvcodec 默认全落 GPU0，多卡时另一块卡**完全不参与编码** | 每管线设 `cuda-device-id`（nvcodec 属性）或按 GPU 分进程设 `CUDA_VISIBLE_DEVICES` |
-| **L-04** | `--gpu-index` 未传给 Godot 子进程 | `Gstreamer/godot_process.cpp:67-69`（注释明说暂不传） | 源码 | 多/混合显卡无法定向选卡 | P4 起按 gpu 传 `--gpu-index <g>`；**注意本机实测设备序为 Intel=0、NVIDIA=1，与直觉相反** |
-| **L-05** | 编码参数由字符串拼接，未校验元素属性存在性 | `Gstreamer/config.cpp:160-172`；`pipeline.cpp:138-141` | 源码 | 配置写了不支持的属性 → `gst_parse_launch` 失败且错误信息不指向配置项 | 启动时对关键属性做 `gst-inspect` 校验或捕获解析错误并回报字段名 |
+| **L-04** | `--gpu-index` 未传给 Godot 子进程 | `src/capture/godot_process.cpp:67-69`（注释明说暂不传） | 源码 | 多/混合显卡无法定向选卡 | P4 起按 gpu 传 `--gpu-index <g>`；**注意本机实测设备序为 Intel=0、NVIDIA=1，与直觉相反** |
+| **L-05** | 编码参数由字符串拼接，未校验元素属性存在性 | `src/config/config.cpp:160-172`；`pipeline.cpp:138-141` | 源码 | 配置写了不支持的属性 → `gst_parse_launch` 失败且错误信息不指向配置项 | 启动时对关键属性做 `gst-inspect` 校验或捕获解析错误并回报字段名 |
 | **L-06** | 单卡 NVENC 并发上限（GeForce 约 3 路）未做容量校验 | `docs/multi-user-multi-gpu-design.md:330`；`config.json` `players_per_gpu=3` 已踩线 | 文档 | 超限时第 4 路编码失败，用户黑屏 | 启动时按卡型校验 `players_per_gpu` 上限并拒绝启动或降级软件编码 |
-| **L-07** | **`encoding.type` 与 `encoding.encoder` 必须手动保持一致，否则报错完全不指向配置** | `Gstreamer/config.cpp:155-180`：按 `type` 选 **options/payloader**，却按 `encoder` 选**元素名** | ✅ **实测**：`type=vp8_sw` 但 `encoder=nvautogpuh264enc` → `Pipeline create failed: no property "deadline" in element "nvautogpuh264enc"` × **6**（全部管线失败）；改成 `encoder=vp8enc` 后 → **失败 0 次、推送帧 57 条** | 用户按 README「切 `vp8_sw`」操作后仍然全黑，且报错指向一个用户没写过的属性名，排障成本极高 | 由 `type` 唯一决定元素名（或校验二者一致并在启动时报出配置项名）；README 明确"两个字段都要改" |
+| **L-07** | **`encoding.type` 与 `encoding.encoder` 必须手动保持一致，否则报错完全不指向配置** | `src/config/config.cpp:155-180`：按 `type` 选 **options/payloader**，却按 `encoder` 选**元素名** | ✅ **实测**：`type=vp8_sw` 但 `encoder=nvautogpuh264enc` → `Pipeline create failed: no property "deadline" in element "nvautogpuh264enc"` × **6**（全部管线失败）；改成 `encoder=vp8enc` 后 → **失败 0 次、推送帧 57 条** | 用户按 README「切 `vp8_sw`」操作后仍然全黑，且报错指向一个用户没写过的属性名，排障成本极高 | 由 `type` 唯一决定元素名（或校验二者一致并在启动时报出配置项名）；README 明确"两个字段都要改" |
 
 > **L-01 已于 2026-10-14 修复并实测验证**（默认 `nvenc` 配置下 `Pipeline create failed: 0`、推送 62 帧、信令产出带真实 SPS/PPS 的 H.264 offer）。它曾是唯一"默认配置当前就坏"的功能缺陷。
 > **L-07 仍未修复**，是"想回退到软件编码也回退不了"的隐藏坑：`type` 改了但 `encoder` 没改时，报错完全不指向配置项。
@@ -129,13 +129,13 @@
 
 | 编号 | 标题 | 证据 | 影响 | 修复建议 |
 |---|---|---|---|---|
-| L-10 | **双 IPC 冗余**：视频走 `/dev/shm`，控制走 per-GPU TCP，两者都是进程间协议 | `Gstreamer/tcp_server.cpp:225-326`、`Gstreamer/shared_frame.h:41-53`、`Godot/test/main.gd:354-423` | 需维护自定义帧头握手 + 长度前缀协议 + 重连状态机；故障面翻倍 | 中期合并为单一通道；或（若引入 libgodot）退化为进程内环形缓冲 |
+| L-10 | **双 IPC 冗余**：视频走 `/dev/shm`，控制走 per-GPU TCP，两者都是进程间协议 | `src/transport/tcp_server.cpp:225-326`、`src/core/shared_frame.h:41-53`、`Godot/test/main.gd:354-423` | 需维护自定义帧头握手 + 长度前缀协议 + 重连状态机；故障面翻倍 | 中期合并为单一通道；或（若引入 libgodot）退化为进程内环形缓冲 |
 | L-11 | **帧通路 3 次 6.2 MB 拷贝 + 同步 GPU 回读** | `main.gd:331`（`get_image()`）、`main.gd:366`（写 shm）、`pipeline.cpp:21`（`gst_buffer_fill`） | 3 用户约 3.35 GB/s 内存流量；同步回读是延迟/抖动主因（`docs/gpu-zero-copy-design.md:44-55`） | 先 `gst_buffer_new_wrapped` 零拷贝包装；再评估异步回读/进程内化 |
 | L-12 | **每 GPU 一进程，但无进程监管** | `godot_process.cpp:142-201`；无 systemd 单元 | 引擎崩溃只靠进程内退避，宿主崩溃无人拉起 | 补 systemd/supervisor 单元 + 健康检查 |
 | L-13 | 传输协议实现下沉到 GDScript 业务代码 | `main.gd:304-423`（帧头布局、写顺序、TCP 状态机全在脚本里） | 协议变更需改脚本 + C++ 两侧；无法单元测试 | 抽到 GDExtension 或用共享头文件生成两侧常量 |
-| L-14 | 全局可变状态 | `Gstreamer/common.h`（`g_config`/`loop`/`soup_session`）、`session.h` | 难以测试与并发推理 | 收敛为显式依赖注入的运行时对象 |
-| L-15 | 输入转发用**字符串切片**而非解析 | `Gstreamer/signalling.cpp:202-223`（`prefix` 匹配 + `substr`） | 客户端 JSON 格式稍有差异（空白/嵌套/字段序）即产生畸形 payload | 改用真正的 JSON 解析（若保留 json-glib 或用内置解析器） |
-| **L-16** | **共享内存单缓冲存在撕裂帧竞态（无双重缓冲、拷贝期间不复检 `ready`）** | 读端 `Gstreamer/tcp_server.cpp:282-322`：观察到新 `write_counter` 后置 `last_counter`，自旋 `ready`（此刻已为 1，实为空转），随后 `gst_buffer_fill` **整段拷贝期间不再校验 `ready`**；写端 `Godot/test/main.gd:354-381` 会在下一帧先置 `ready=0` 并覆盖同一数据区 | 拷贝耗时约 1–2 ms（6.2 MB），若写端恰好开始下一帧（正常 16.7 ms 一帧，但调度抖动/卡顿时会追上），读端会把**半新半旧的数据**送去编码 → 花屏/撕裂。概率随负载升高，难以复现定位 | 改为双缓冲（写端交替 A/B，头里带 slot 号）或"拷贝后复检 `ready`+`counter`，不一致则丢弃重读" |
+| L-14 | 全局可变状态 | `src/util/common.h`（`g_config`/`loop`/`soup_session`）、`session.h` | 难以测试与并发推理 | 收敛为显式依赖注入的运行时对象 |
+| L-15 | 输入转发用**字符串切片**而非解析 | `src/signalling/signalling.cpp:202-223`（`prefix` 匹配 + `substr`） | 客户端 JSON 格式稍有差异（空白/嵌套/字段序）即产生畸形 payload | 改用真正的 JSON 解析（若保留 json-glib 或用内置解析器） |
+| **L-16** | **共享内存单缓冲存在撕裂帧竞态（无双重缓冲、拷贝期间不复检 `ready`）** | 读端 `src/transport/tcp_server.cpp:282-322`：观察到新 `write_counter` 后置 `last_counter`，自旋 `ready`（此刻已为 1，实为空转），随后 `gst_buffer_fill` **整段拷贝期间不再校验 `ready`**；写端 `Godot/test/main.gd:354-381` 会在下一帧先置 `ready=0` 并覆盖同一数据区 | 拷贝耗时约 1–2 ms（6.2 MB），若写端恰好开始下一帧（正常 16.7 ms 一帧，但调度抖动/卡顿时会追上），读端会把**半新半旧的数据**送去编码 → 花屏/撕裂。概率随负载升高，难以复现定位 | 改为双缓冲（写端交替 A/B，头里带 slot 号）或"拷贝后复检 `ready`+`counter`，不一致则丢弃重读" |
 
 ### 1.3 可靠性与运维（P1）
 
@@ -154,9 +154,9 @@
 
 | 编号 | 标题 | 证据 | 影响 | 修复建议 |
 |---|---|---|---|---|
-| L-30 | **信令 WebSocket 客户端接受任意证书** | `Gstreamer/signalling.cpp:347-352`：`on_accept_certificate` 打印 "Accepting … despite validation" 并接受；`:443-455` 虽加载 CA 库但被覆盖 | 中间人可劫持信令 → 可注入 SDP/ICE | 去掉 accept-all 回调，信任 `signalling_ca_path`；仅开发模式显式开关 |
+| L-30 | **信令 WebSocket 客户端接受任意证书** | `src/signalling/signalling.cpp:347-352`：`on_accept_certificate` 打印 "Accepting … despite validation" 并接受；`:443-455` 虽加载 CA 库但被覆盖 | 中间人可劫持信令 → 可注入 SDP/ICE | 去掉 accept-all 回调，信任 `signalling_ca_path`；仅开发模式显式开关 |
 | L-31 | **信令无认证/授权，可劫持他人会话槽位** | `signalling-server/server.js:242-260`：`HELLO <id>` 只校验索引 `< MAX_USERS`，随后 **无条件 `clients.set(id, state)` 覆盖已有槽位**；`:264-268` 的 `SESSION <peer_id>` 亦无任何约束 | ✅ 实测（读码） | 任意客户端发 `HELLO viewer_0` 即可顶掉该观众，再 `SESSION sender_0` 接收他人视频流 / 注入 SDP·ICE | 引入一次性 ASSIGN 票据或共享令牌；`HELLO` 拒绝已占用的 id（改用 `ASSIGN` 为唯一入口）；`SESSION` 校验对端白名单 |
-| L-32 | 输入通道无鉴权 | `Gstreamer/tcp_server.cpp` 无 token 校验 | 本机端口暴露即可注入输入 | 绑定回环 + 随机端口/令牌 |
+| L-32 | 输入通道无鉴权 | `src/transport/tcp_server.cpp` 无 token 校验 | 本机端口暴露即可注入输入 | 绑定回环 + 随机端口/令牌 |
 | **L-34** | **WebSocket 帧长无上限 + 无界缓冲 + O(n²) 拼接** | `signalling-server/server.js:59-60`（每 chunk `Buffer.concat`）、`:72-87`（只查高 32 位，`payloadLen` 可达 2^32-1） | 单连接声明超大帧即可耗尽内存/CPU 并阻塞事件循环（**最容易触发的 DoS**） | 设 `MAX_FRAME`/`MAX_BUFFER`（如 64 KB），超限 `close(1009)` |
 | L-35 | 半开连接永久占槽（无服务端心跳） | `server.js:352-368` 只监听 data/end/error，无 ping/timeout；`README.md:145` 却称"关闭后槽位自动释放" | WiFi 掉线/挂起后槽位泄漏，最终"全满"且与文档不符 | 服务端 ping/pong 空闲超时（如 60 s）+ `setTimeout` + `close` 兜底 |
 | L-36 | ASSIGN 不校验对端 sender 是否在线 | `server.js:221-233` | 分配到无对端的槽位 → 黑屏且槽位虚占 | 分配需 `sender_k` 在线，或由 sender 预注册"就绪"槽位 |
@@ -168,7 +168,7 @@
 
 | 编号 | 标题 | 证据 |
 |---|---|---|
-| L-40 | 旧配置键仍在结构体中并参与加载 | `Gstreamer/config.h:34,42,43,61`（`godot_tcp_port`/`self_id`/`peer_id`/`shm_path`）；`config.json:16,24,25,57` |
+| L-40 | 旧配置键仍在结构体中并参与加载 | `src/config/config.h:34,42,43,61`（`godot_tcp_port`/`self_id`/`peer_id`/`shm_path`）；`config.json:16,24,25,57` |
 | L-41 | `godot.launch` 默认值文档冲突 | README 称默认 false；`config.json:20` 实际 `true`；`config.json.example:20` 为 false |
 | L-42 | 文档内部不一致 ≥10 处 | 详见首份审计：进程数口径、Node 版本、示例拓扑、多卡完成度、"零拷贝"措辞等 |
 | L-43 | 项目文件强制加载未被使用的 GDExtension | `Godot/test/.godot/extension_list.cfg` → `addons/webrtc/webrtc.gdextension` |
@@ -207,7 +207,7 @@
 | L-50 | **Emacs 自动保存文件未被忽略** | `Gstreamer/#common.cpp#` 未被跟踪也未被忽略（`git check-ignore` 无命中）；`.gitignore` 只覆盖 `*.bak`/`*~`/`*.swp`，缺 `*#*` | ✅ 实测 |
 | L-51 | **98 MB 未使用的 GDExtension + Git LFS 硬依赖**，且 **LFS 规则实际被更深层 `* text=auto eol=lf` 覆盖** | `Godot/test/addons/webrtc/lib/*`（12 `.so` + 6 `.dylib` + 4 `.dll`，24 个 LFS 跟踪文件）；`git check-attr` 实测该类 `.so` 为 `text: auto`（根 `.gitattributes:3-6` 被 `Godot/test/.gitattributes:2` 覆盖） | ✅ 实测 + 反证实验 |
 | L-52 | 工作区 51 MB 无关虚拟环境 | `.venv_ppt/`（仓库级未忽略，靠 venv 内部 `.gitignore` 侥幸不进 git） | ✅ 实测 |
-| L-53 | 构建仍为 Makefile，无 CMake | `Gstreamer/Makefile` | ✅ |
+| L-53 | ~~构建仍为 Makefile，无 CMake~~ **✅ 已解决** | 已迁移到 CMake（commit `fc34120`）并重排为 `src/` 分模块；原 `Gstreamer/Makefile` 已删除 | ✅ |
 | L-54 | 无 CI / 无格式化 / 无静态检查 | 无 `.github/`、无 `.clang-format` | ✅ |
 | L-55 | 生成物易被误留仓库 | 本次 `--dump-extension-api` 产生的 `Godot/test/extension_api.json`（6.7 MB）曾出现在工作区（已清理） | ✅ 实测 |
 | L-56 | **nginx 配置含默认模板残留 + 硬编码绝对路径** | 死配置 `html/nginx.conf:97-116`（PHP/FastCGI/`.htaccess` 注释块）；硬编码 `/home/myc/develop/test/...`（`:52-53,61,71-72`） | ✅ 实测 |
@@ -223,7 +223,7 @@
 
 | 编号 | 标题 | 严重度 | 证据 | 验证 | 影响 / 修复 |
 |---|---|---|---|---|---|
-| **B-1** | **`send_sdp_to_peer`/`send_ice_to_peer` 每次调用泄漏整棵 `JsonObject` 树** | **高** | `Gstreamer/signalling.cpp:51-63`（`msg` 创建后送入 `json_object_to_string`，函数结束前从未 `json_object_unref`）、`:65-77` 同样 | ✅ **实测**：复刻该路径 20 万次 → RSS 增长 **240 972 KB（≈1.2 KB/次）**；补一行 `json_object_unref(msg)` 后增长 **0 KB** | 长运行进程内存单调增长（ICE candidate 可达数十条/连接 × 每用户 × 多次重连）。**一行修复** |
+| **B-1** | **`send_sdp_to_peer`/`send_ice_to_peer` 每次调用泄漏整棵 `JsonObject` 树** | **高** | `src/signalling/signalling.cpp:51-63`（`msg` 创建后送入 `json_object_to_string`，函数结束前从未 `json_object_unref`）、`:65-77` 同样 | ✅ **实测**：复刻该路径 20 万次 → RSS 增长 **240 972 KB（≈1.2 KB/次）**；补一行 `json_object_unref(msg)` 后增长 **0 KB** | 长运行进程内存单调增长（ICE candidate 可达数十条/连接 × 每用户 × 多次重连）。**一行修复** |
 | **C-3** | **远端一条 JSON 即可令 sender 段错误退出（DoS）** | **高** | `signalling.cpp:151-153`（`json_object_get_string_member` 缺成员/类型不符返回 NULL + critical）、`:162`（`strlen(sdp_str)` 对 NULL 解引用）、`:193-199`（`candidate` 可能 NULL 直接送入 `add-ice-candidate`）、`:279-285` | ✅ 源码 | 任何能连上信令的对端发 `{"sdp":{"type":"offer"}}` 即崩溃 | 用 `json_object_has_member` + `JSON_NODE_HOLDS_VALUE` 显式校验并逐字段判空；整体 schema 校验 |
 | **C-1** | **`fps=0` 触发整数除零崩溃（SIGFPE）** | **高** | `pipeline.cpp:33`（`frame_index % g_config.frame_fps`）、`:25,27`（`gst_util_uint64_scale` 分母为 0）；来源 `config.cpp:118`（`get_int` 无下界） | ✅ 源码 | 配置文件可写者即可崩溃进程 | 加载后强校验 `0 < fps ≤ 1000`，非法拒绝启动 |
 | **A-1** | **SHM `ready` 自旋无超时、不检查 `shm_running`，写端异常即永久挂死** | **高** | `tcp_server.cpp:308-314`（`while(!ready){…yield()}`）、`:340-345`（`join()`） | ✅ 源码 | Godot 若在 `ready=0` 之后、写头部之前崩溃/被 SIGSTOP/长卡顿，读线程永不退出 → `stop_shm_frame_reader` 的 `join()` 永久阻塞 → 复位路径与整进程清理全部卡死，**Ctrl-C 也无效**。改为「超时上限 + 每轮检查 `shm_running`」 |
@@ -365,7 +365,7 @@ Node v26.11.1 · nginx 1.31.6 · OpenSSL 3.6.5 · GStreamer 1.28.8 · libsoup 3.
 |---|---|---|---|---|
 | **P0a** 止血（最高优先） | §1.0 最紧急清单 8 项：S-1 证书校验、L-01 `cudaconvert`、C-3 JSON 校验、C-1 `fps` 校验、B-1 JSON 泄漏、A-1 自旋超时、A-4 非阻塞发送、N-01/N-02 信令鉴权与配对 | 2–4 人日 | 8 项各有验证：硬件出流、畸形 JSON 不崩、`fps=0` 不崩、200k 次发送无内存增长、写端 SIGSTOP 后仍可 Ctrl-C、跨用户注入被拒 | 低 |
 | **P0b** 其余缺陷与卫生 | L-02（STUN 可配，两端）、L-05/L-06、A-12（CLOEXEC）、A-15/D-8（计数归零）、A-17/C-2（配置校验）、D-3/D-4/D-5（删死代码）、C-6/S-3（绑回环）、L1 卫生清理 | 2–3 人日 | `git status` 干净；无外网可启动；TCP 端口仅回环可达 | 低 |
-| **P1** 构建工程化 | CMake 化（承接首份报告）+ sanitizer/debug/werror 目标；`SRCS` 改通配；加 `pkg-config --atleast-version` 约束 | 1–2 人日 | `cmake -B build && cmake --build build` 等价产物；ASan/TSan 目标可跑 | 低 |
+| **P1** 构建工程化 ✅ **已完成** | CMake 化（`fc34120`）+ 源码重排 `src/` 分模块 + sanitizer/debug 目标 + 源文件通配 + `pkg-config` 版本约束。**未做**：`-Werror` | 已完成（1 人日量级） | ✅ 已验证：全新构建 0 告警、产物依赖数不变（51）、端到端 Pipeline 失败 0/推送 59 帧/HELLO_OK 3、ASan 与 TSan 目标均可构建 | 低 |
 | **P2** 依赖裁剪 | 见 **L2**（含一个前置决策：是否保留 libsoup） | 3–8 人日 | 外部依赖收敛到 4 项以内；端到端延迟/帧率不回归；L-15 一并修复 | 中 |
 | **P3** 静态化决策 | 二选一：L3-a 自建静态 GStreamer ／ L3-b 换栈 | 决策 1 人日 | 产出 go/no-go 结论与成本模型 | 中 |
 | **P4** 静态化实施 | 按 P3 结论执行 | 5–10（a）／15–30（b）人日 | `ldd` 仅剩 `libc/libstdc++/NVIDIA`（+shared libgodot）；合规文档齐备 | **高**（b 路） |
@@ -468,8 +468,8 @@ if not FileAccess.file_exists(config_path):
 
 ```bash
 # 依赖面
-ldd Gstreamer/webrtc_sender | wc -l                      # → 51
-ldd Gstreamer/webrtc_sender | awk '{print $3}' | grep '^/' | \
+ldd build/webrtc_sender | wc -l                      # → 51
+ldd build/webrtc_sender | awk '{print $3}' | grep '^/' | \
   while read -r so; do pacman -Qoq "$so"; done | sort -u | wc -l   # → 30 个包
 
 # 静态库可用性

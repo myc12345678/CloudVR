@@ -5,12 +5,12 @@
 #include <string>
 #include <vector>
 
-#include "common.h"
-#include "config.h"
-#include "godot_process.h"
-#include "pipeline.h"
-#include "signalling.h"
-#include "tcp_server.h"
+#include "util/common.h"
+#include "config/config.h"
+#include "capture/godot_process.h"
+#include "encode/pipeline.h"
+#include "signalling/signalling.h"
+#include "transport/tcp_server.h"
 
 static void on_signal(int /*signum*/) {
   // 置位关停标志，停止所有后台重连定时器，并让主循环退出以走干净清理
@@ -39,7 +39,7 @@ int main(int argc, char *argv[]) {
   if (!explicit_config.empty())
     candidates.push_back(explicit_config);
   candidates.push_back("config.json");    // 从仓库根目录运行
-  candidates.push_back("../config.json"); // 从 Gstreamer/ 目录运行
+  candidates.push_back("../config.json"); // 从 build/ 目录运行
 
   if (load_config_from_candidates(g_config, candidates)) {
     std::cout << "config.json loaded (runtime) -> " << g_config.frame_width

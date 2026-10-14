@@ -7,7 +7,7 @@
 | 路径 | 内容 |
 |------|------|
 | `Godot/test/` | Godot 游戏引擎（GDScript + 场景），每玩家一个 SubViewport 独立渲染/捕获帧，接收反向输入（经 `NetworkInputRouter` → `PlayerInput` 分发给各玩家） |
-| `Gstreamer/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送；`godot_process.*` 负责启动/重启 Godot 子进程 |
+| `src/` | C++17 发送端：读取共享内存帧 → 编码 → WebRTC 发送；`godot_process.*` 负责启动/重启 Godot 子进程 |
 | `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 + 用户槽位自动分配 |
 | `html/` | 浏览器前端（WebRTC 接收端）+ nginx 配置 |
 | `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot（旧的手动启动方式，现可由 C++ 自动启动替代） |
@@ -19,7 +19,7 @@
 |------|------|------|
 | `signalling-server` | Node.js（无需 npm 安装任何包） | v26 |
 | `html/`（nginx） | nginx | 1.31 |
-| `Gstreamer/` | C++17（g++）+ CMake ≥3.16 + pkg-config、GStreamer ≥1.20（`gstreamer-webrtc`、`gstreamer-sdp`、`gstreamer-app`、`libsoup-3.0`、`json-glib-1.0`） | GStreamer 1.28 |
+| `src/` | C++17（g++）+ CMake ≥3.16 + pkg-config、GStreamer ≥1.20（`gstreamer-webrtc`、`gstreamer-sdp`、`gstreamer-app`、`libsoup-3.0`、`json-glib-1.0`） | GStreamer 1.28 |
 | `Godot/test/` | Godot 4.x（Forward+ / Vulkan） | 4.7 |
 | 视频编码 | NVIDIA GPU + 驱动（NVENC 硬件编码，见 `config.json` 的 `encoding.type`） | RTX 4060 |
 | `scripts/` | Python 3 | 3.14 |
@@ -199,7 +199,7 @@ cd <仓库根目录> && ./build/webrtc_sender
 ### 视频流（非 Godot 文档范围）
 
 `SubViewport` 渲染 → 共享内存零拷贝 → GStreamer NVENC → WebRTC 这段与本系统耦合，
-与 Godot 官方文档无关；改动请参考 `Gstreamer/`、`shared_frame.h`。
+与 Godot 官方文档无关；改动请参考 `src/`、`src/core/shared_frame.h`。
 
 ## 关闭流程
 
@@ -245,7 +245,7 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 
 所有子系统均在**运行时**读取该文件，无需重新编译：
 
-- `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `Gstreamer/config.cpp`）。
+- `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `src/config/config.cpp`）。
   可用 `--config <path>` 显式指定；默认依次查找当前目录及上级目录的 `config.json`。
 - `html/script.js`：页面启动时 `fetch('/config.json')` 读取（nginx 在 `/config.json` 暴露它，
   见 `html/nginx.conf`）。

@@ -1,12 +1,12 @@
-#include "pipeline.h"
+#include "encode/pipeline.h"
 
 #include <iostream>
 #include <sstream>
 
-#include "common.h"
-#include "config.h"
-#include "signalling.h"
-#include "tcp_server.h"
+#include "util/common.h"
+#include "config/config.h"
+#include "signalling/signalling.h"
+#include "transport/tcp_server.h"
 
 void push_raw_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
   UserSession &s = session(u);

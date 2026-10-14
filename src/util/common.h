@@ -12,10 +12,10 @@
 
 // ======================== 运行时配置 ========================
 // 所有可配置项在启动时从 config.json 读取（见 config.cpp / main.cpp）
-#include "config.h"
+#include "config/config.h"
 
-#include "session.h"
-#include "shared_frame.h"
+#include "core/session.h"
+#include "core/shared_frame.h"
 
 // ======================== 全局状态 ========================
 // 进程级共享状态（不属于任何单个用户）。

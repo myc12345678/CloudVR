@@ -11,7 +11,7 @@
 #include <gst/gst.h>
 #include <libsoup/soup.h>
 
-#include "shared_frame.h"
+#include "core/shared_frame.h"
 
 // ======================== 每用户会话状态 ========================
 // 多用户改造（P2）把原先 common.cpp 里的单用户全局单例（pipeline/webrtcbin/

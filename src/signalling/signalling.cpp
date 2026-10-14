@@ -1,4 +1,4 @@
-#include "signalling.h"
+#include "signalling/signalling.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8,9 +8,9 @@
 #include <iostream>
 #include <json-glib/json-glib.h>
 
-#include "common.h"
-#include "pipeline.h"
-#include "tcp_server.h"
+#include "util/common.h"
+#include "encode/pipeline.h"
+#include "transport/tcp_server.h"
 
 // ---- 信令重连状态（现按用户索引 u 存入 UserSession）----
 

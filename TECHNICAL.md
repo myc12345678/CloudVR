@@ -157,7 +157,7 @@
 ```
 config.json
     │
-    ├── Gstreamer/config.cpp  ──→ 启动时用 json-glib 解析（填充 Gstreamer/config.h 的 Config）
+    ├── src/config/config.cpp  ──→ 启动时用 json-glib 解析（填充 src/config/config.h 的 Config）
     ├── html/script.js        ──→ 页面启动时 fetch('/config.json')（nginx 暴露）
     ├── signalling-server/server.js ──→ 启动时直接读取
     └── Godot/test/main.gd    ──→ 启动时直接读取
@@ -641,17 +641,17 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 ├── docs/
 │   ├── multi-user-multi-gpu-design.md   # 多用户 + 多 GPU 架构设计文档
 │   └── gpu-zero-copy-design.md          # GPU 零拷贝分析
-├── Gstreamer/
-│   ├── main.cpp                         # 入口（加载配置 + 校验 + 编排启动）
-│   ├── config.cpp / config.h            # 运行时配置解析（json-glib）+ Config 结构
-│   ├── session.h                        # UserSession / GpuTcpState 结构
-│   ├── godot_process.cpp / .h           # Godot 子进程启动/重启/关停
-│   ├── pipeline.cpp / pipeline.h        # GStreamer Pipeline 构建（每用户一条）
-│   ├── signalling.cpp / signalling.h    # WebRTC 信令 + WebSocket（按 u 隔离）
-│   ├── tcp_server.cpp / tcp_server.h    # TCP 控制（每 GPU 一条）+ 共享内存读取
-│   ├── common.cpp / common.h            # 全局状态 + g_sessions/g_gpu_tcp
-│   ├── shared_frame.h                   # 共享内存数据布局（头部固定 16 字节）
-│   └── （构建脚本已上移到仓库根的 CMakeLists.txt）
+├── CMakeLists.txt                       # 构建入口（仓库根，单一来源）
+├── src/                                 # 发送端全部源码；以 src/ 为唯一头文件搜索根
+│   ├── app/main.cpp                     # 入口（加载配置 + 校验 + 编排启动）
+│   ├── config/config.cpp / .h           # 运行时配置解析（json-glib）+ Config 结构
+│   ├── core/session.h                   # UserSession / GpuTcpState 结构
+│   ├── core/shared_frame.h              # Godot ↔ sender 共享内存数据布局（头部 16 字节）
+│   ├── capture/godot_process.cpp / .h   # Godot 子进程启动/重启/关停
+│   ├── transport/tcp_server.cpp / .h    # TCP 控制（每 GPU 一条）+ 共享内存读取
+│   ├── encode/pipeline.cpp / .h         # GStreamer Pipeline 构建（每用户一条）
+│   ├── signalling/signalling.cpp / .h   # 信令 WebSocket 客户端（按 u 隔离）
+│   └── util/common.cpp / .h             # 全局状态 + g_sessions/g_gpu_tcp
 ├── signalling-server/
 │   ├── server.js                        # 纯 Node.js 信令服务器 + 槽位自动分配
 │   └── certs/                           # TLS 证书
@@ -704,7 +704,7 @@ Godot（写入端）将 RGB8 像素数据写入 `/dev/shm` 文件，GStreamer（
 **数据结构（两端一致）：**
 
 ```c
-// Gstreamer/shared_frame.h
+// src/core/shared_frame.h
 struct SharedFrameLayout {
   std::atomic<uint64_t> write_counter;   // offset 0: Godot 每写一帧递增
   std::atomic<uint32_t> frame_size;      // offset 8: 帧数据字节数
@@ -737,7 +737,7 @@ shm_file.flush()                       # 提交所有变更
 **GStreamer 端读取（C++）：**
 
 ```cpp
-// Gstreamer/tcp_server.cpp — shm_reader_loop()
+// src/transport/tcp_server.cpp — shm_reader_loop()
 while (shm_running.load(std::memory_order_acquire)) {
     uint64_t current = shm_frame->write_counter.load(std::memory_order_acquire);
     if (current == last_counter) {
@@ -765,7 +765,7 @@ while (shm_running.load(std::memory_order_acquire)) {
 **mmap 映射：**
 
 ```cpp
-// Gstreamer/tcp_server.cpp — shm_reader_loop() 内的“打开/校验/mmap”分支
+// src/transport/tcp_server.cpp — shm_reader_loop() 内的“打开/校验/mmap”分支
 // 注：该段现在运行在读帧线程内部，且仅在 shm_frame 为空（尚未连接/被重建）时执行，
 // 不进每帧热路径。失败时 usleep(1s) 重试，而非报错退出。
 shm_fd = open(SHM_FRAME_PATH, O_RDONLY);          // /dev/shm 是 tmpfs
@@ -782,7 +782,7 @@ shm_frame = static_cast<SharedFrameLayout *>(
 传统做法使用 `SO_RCVTIMEO` 设置固定超时，但 Godot 在场景加载时可能长时间无数据发送，固定超时会导致误断连。本项目改用 TCP Keepalive 检测物理断开：
 
 ```cpp
-// Gstreamer/tcp_server.cpp — tcp_server_loop()
+// src/transport/tcp_server.cpp — tcp_server_loop()
 int keepalive = 1;
 int keepidle  = 30;   // 30 秒无数据后开始探测
 int keepintvl = 5;    // 探测间隔 5 秒
@@ -814,7 +814,7 @@ if (msg.startsWith('{"input":')) {
 **C++ 端（字符串前缀匹配提取，省去 DOM 构建）：**
 
 ```cpp
-// Gstreamer/signalling.cpp — handle_input_message()
+// src/signalling/signalling.cpp — handle_input_message()
 const std::string prefix = R"({"input":)";
 if (raw_input_json.rfind(prefix, 0) != 0)
     return;
@@ -832,7 +832,7 @@ send_to_godot(inner.c_str(), inner.size());
 **GStreamer 发送端采用了多项低延迟优化：**
 
 ```cpp
-// Gstreamer/pipeline.cpp — build_pipeline_desc()
+// src/encode/pipeline.cpp — build_pipeline_desc()
 "appsrc name=godotsrc is-live=true format=time do-timestamp=true "
 "caps=video/x-raw,format=RGB,width=" FRAME_WIDTH ",height=" FRAME_HEIGHT
     ",framerate=" FRAME_FPS "/1 ! "
@@ -932,8 +932,8 @@ const fps = (framesDecoded - lastFramesDecoded) / dtSec;
 ```
 
 ```cpp
-// Gstreamer/config.cpp — 启动时用 json-glib 解析 config.json，填充全局 Config
-Config g_config;                       // 运行时全局配置（见 Gstreamer/config.h）
+// src/config/config.cpp — 启动时用 json-glib 解析 config.json，填充全局 Config
+Config g_config;                       // 运行时全局配置（见 src/config/config.h）
 bool load_config(Config &cfg, const std::string &path);
 ```
 
@@ -1019,7 +1019,7 @@ appsrc (CPU RGB) → cudaupload → cudaconvert → nvh264enc → h264parse → 
 ```
 
 ```cpp
-// Gstreamer/pipeline.cpp — build_pipeline_desc()
+// src/encode/pipeline.cpp — build_pipeline_desc()
 if (g_config.enc_is_hardware) {
     // cudaupload:  零拷贝上传 CPU 帧到 GPU 显存
     // cudaconvert: GPU 端 RGB→NV12 格式转换（nvh264enc 强制要求 NV12）
