@@ -56,7 +56,7 @@ MAX_USERS = 0
 
 def load_runtime_config(port_override):
     """从仓库根的 config.json 读取端口与并发上限——测试必须跟随真实配置，
-    否则配置漂移（例如 signalling_url 指错端口）不会被测试发现。"""
+    否则配置漂移不会被测试发现（历史上就出现过页面能开但拿不到流的问题）。"""
     port, max_users = 8443, 3
     if CONFIG_PATH.exists():
         try:
@@ -125,8 +125,8 @@ async def preflight():
         check(
             "sender_0 已注册",
             False,
-            f"得到 {r!r}：sender 未连上内置信令服务，请检查 config.json 的 "
-            "gstreamer.signalling_url 是否与 http.port 同端口",
+            f"得到 {r!r}：sender 未注册为本地对端。请确认启动日志里有 "
+            "'signalling: 本地对端已注册 sender_0'",
         )
         return True, False
 

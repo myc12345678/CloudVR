@@ -5,7 +5,6 @@
 // ======================== 全局状态定义 ========================
 
 GMainLoop *loop = nullptr;
-SoupSession *soup_session = nullptr;
 
 std::atomic<bool> shutting_down{false};
 

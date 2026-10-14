@@ -1,7 +1,9 @@
 #ifndef SIGNALLING_SERVER_H
 #define SIGNALLING_SERVER_H
 
+#include <functional>
 #include <libsoup/soup.h>
+#include <string>
 
 // ======================== 内置信令服务端（P3：替代 Node）=======================
 // 挂到内置 HTTP 服务的 /ws 路径，承担「WebRTC 信令中继 + 输入转发 + 用户槽位分配」。
@@ -23,6 +25,27 @@
 
 // 把信令 WebSocket 处理器挂到给定 SoupServer 的 /ws 上（幂等）。
 void signalling_server_attach(SoupServer *server);
+
+// ======================== 本地对端（进程内 sender）=======================
+// 把某个 id（如 sender_<u>）绑定到**进程内的回调**而非 WS 连接。
+//
+// 这样 sender 侧不必再开一个 WS 客户端连自己（旧实现经回环 WSS 绕一圈），
+// 既少一跳，也顺带消除了客户端 TLS——包括安全审计的 S-1（客户端无条件接受
+// 服务器证书）。浏览器侧完全无感：它仍按原协议 SESSION sender_<u>，由本模块
+// 把消息直接投递给本地回调。
+//
+// 线程约束：sink 在 WS 处理所在线程（GLib 主循环）中被调用。调用方若来自
+// 其它线程（例如 libnice 的 ICE 回调），须先自行 marshal 到主循环，见
+// signalling.cpp 的 send_text()。
+using SignallingLocalSink = std::function<void(const std::string &)>;
+
+void signalling_server_register_local(const std::string &id,
+                                      SignallingLocalSink sink);
+void signalling_server_unregister_local(const std::string &id);
+
+// 向指定 id 发送文本：本地对端直接回调，否则经 WS 发送。
+// 返回是否送达（对端不存在或未连接时为 false）。
+bool signalling_server_send_to(const std::string &id, const std::string &text);
 
 // 关闭所有连接并解绑（幂等）。应在 HTTP 服务停止前调用。
 void signalling_server_detach();

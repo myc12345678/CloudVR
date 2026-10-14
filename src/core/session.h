@@ -40,11 +40,8 @@ struct UserSession {
   uint64_t last_reset_ms = 0;
 
   // ---- signalling ----
-  SoupWebsocketConnection *ws_conn = nullptr;
-  bool ws_handshake_done = false;
-  bool session_started = false;
-  unsigned sign_reconnect_attempts = 0;
-  guint sign_reconnect_source = 0;
+  // 传输已改为信令服务的「本地对端」（进程内回调），因此不再持有 WS 连接，
+  // 也没有握手/重连状态。见 src/signalling/signalling.cpp。
   std::string sender_id; // 展开后的信令 id（P3 起用模板展开）
   std::string viewer_id; // 展开后的信令 id（P3 起用模板展开）
 

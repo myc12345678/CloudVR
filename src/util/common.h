@@ -21,10 +21,8 @@
 // 进程级共享状态（不属于任何单个用户）。
 
 extern GMainLoop *loop;
-// libsoup 会话：多个 WebSocket 连接可共用一个 SoupSession（P2 起保留为共享）。
-extern SoupSession *soup_session;
 
-// 全局关停标志：由信号处理器置位，用于停止所有后台重连调度
+// 全局关停标志：由信号处理器置位，用于停止后台线程与主循环
 extern std::atomic<bool> shutting_down;
 
 // ======================== 每用户会话 ========================

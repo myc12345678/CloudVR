@@ -136,13 +136,8 @@ bool load_config(Config &cfg, const std::string &config_path) {
     }
   }
 
-  // ---- gstreamer (signalling) ----
+  // ---- gstreamer（仅剩逐用户 id 模板；信令地址/CA 已随客户端一并移除）----
   if (JsonObject *gs = get_object(obj, "gstreamer")) {
-    cfg.self_id = get_string(gs, "self_id", cfg.self_id);
-    cfg.peer_id = get_string(gs, "peer_id", cfg.peer_id);
-    cfg.signalling_url = get_string(gs, "signalling_url", cfg.signalling_url);
-    cfg.signalling_ca_path =
-        get_string(gs, "signalling_ca_path", cfg.signalling_ca_path);
     if (JsonObject *idt = get_object(gs, "id_template")) {
       cfg.sender_id_template =
           get_string(idt, "sender", cfg.sender_id_template);

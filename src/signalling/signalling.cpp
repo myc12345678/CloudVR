@@ -1,33 +1,63 @@
 #include "signalling/signalling.h"
 
-#include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <gst/sdp/sdp.h>
 #include <gst/webrtc/webrtc.h>
 #include <iostream>
 #include <json-glib/json-glib.h>
+#include <string>
 
-#include "util/common.h"
 #include "encode/pipeline.h"
+#include "signalling/signalling_server.h"
 #include "transport/tcp_server.h"
+#include "util/common.h"
 
-// ---- 信令重连状态（现按用户索引 u 存入 UserSession）----
+// ============================================================================
+// 本文件职责：**会话侧的信令处理**（SDP / ICE / 输入 / 重协商）。
+//
+// 传输层已从"自建 WS 客户端"改为信令服务的**本地对端**：
+//   旧：sender 自身开一个 WS 客户端，经回环 wss://127.0.0.1:<port>/ws 连到
+//       本进程内的信令服务，再 HELLO sender_<u> / SESSION viewer_<u>。
+//   新：直接 signalling_server_register_local("sender_<u>", sink) 注册进程内
+//       回调；浏览器侧完全无感（它仍 SESSION sender_<u>）。
+//
+// 收益：少一跳回环 WSS；不再需要客户端 TLS —— 顺带消除了安全审计的 S-1
+//      （客户端无条件接受服务器证书的 accept-certificate 回调）。
+// ============================================================================
 
-// 前向声明（互相调用）
-static void schedule_signalling_reconnect(int u);
-static gboolean try_connect_signalling(gpointer data);
-static void start_signalling_connect(int u);
+// ======================== 传输：发往浏览器 ========================
+// A-6：ICE 候选由 libnice 的线程回调（on-ice-candidate），而 SDP 路径由
+// GstPromise 在主循环回调。libsoup3 的线程安全仅覆盖"发送消息"一类 API，
+// 其余 API（含连接对象本身）必须在创建它的线程使用；信令服务的 SoupServer
+// 是在主循环创建的。因此外发统一 **marshal 回主循环**，不跨线程直调 libsoup。
+// （旧实现经回环 WSS 时同样存在该问题：soup_websocket_connection_send_text
+//   仍在 ICE 线程被直接调用。）
+
+struct PendingSend {
+  int u;
+  std::string text;
+};
+
+gboolean send_on_main(gpointer data) {
+  PendingSend *p = static_cast<PendingSend *>(data);
+  // 在主循环内读取会话字段，避免跨线程读写 std::string
+  signalling_server_send_to(session(p->u).viewer_id, p->text);
+  delete p;
+  return G_SOURCE_REMOVE;
+}
+
+// 发送给该用户的浏览器端（viewer_<u>）。对端尚未接入时静默丢弃——
+// 启动初期的 offer 常常落空，属正常现象（浏览器稍后会用 {"reset":true} 触发重协商）。
+static void send_text(int u, const std::string &text) {
+  if (g_main_context_is_owner(g_main_context_default())) {
+    signalling_server_send_to(session(u).viewer_id, text);
+    return;
+  }
+  g_main_context_invoke(g_main_context_default(), send_on_main,
+                        new PendingSend{u, text});
+}
 
 // ======================== JSON 工具 ========================
-
-static void send_text(int u, const std::string &text) {
-  UserSession &s = session(u);
-  if (s.ws_conn) {
-    soup_websocket_connection_send_text(s.ws_conn, text.c_str());
-    std::cout << "SEND: " << text << std::endl;
-  }
-}
 
 static gchar *json_object_to_string(JsonObject *obj) {
   JsonNode *root = json_node_new(JSON_NODE_OBJECT);
@@ -76,7 +106,7 @@ static void send_ice_to_peer(int u, guint mlineindex, const gchar *candidate) {
   g_free(text);
 }
 
-// ======================== WebRTC 信号回调 ========================
+// ======================== WebRTC 回调（GstPromise 在主循环触发）========================
 
 static void on_offer_created(GstPromise *promise, gpointer data) {
   int u = GPOINTER_TO_INT(data);
@@ -104,7 +134,8 @@ static void on_negotiation_needed(GstElement *element, gpointer data) {
 static void on_ice_candidate(GstElement *, guint mlineindex, gchar *candidate,
                              gpointer data) {
   int u = GPOINTER_TO_INT(data);
-  std::cout << "Local ICE candidate: " << candidate << std::endl;
+  // 注意：本回调在 libnice 线程，send_text 会自行 marshal 回主循环（A-6）。
+  // 不打印候选内容（S-4：候选含内网 IP）。
   send_ice_to_peer(u, mlineindex, candidate);
 }
 
@@ -127,27 +158,6 @@ static void on_set_description_promise_result(GstPromise *promise,
 
 // ======================== 信令消息处理 ========================
 
-// 异步 create-answer 完成回调
-static void on_create_answer_promise_done(GstPromise *promise,
-                                          gpointer data) {
-  int u = GPOINTER_TO_INT(data);
-  const GstStructure *reply = gst_promise_get_reply(promise);
-  GstWebRTCSessionDescription *local_answer = nullptr;
-  gst_structure_get(reply, "answer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION,
-                    &local_answer, nullptr);
-
-  // 异步设置本地描述
-  GstPromise *set_local_promise = gst_promise_new_with_change_func(
-      on_set_description_promise_result, (gpointer) "set-local-description",
-      nullptr);
-  g_signal_emit_by_name(session(u).webrtcbin, "set-local-description",
-                        local_answer, set_local_promise);
-
-  send_sdp_to_peer(u, "answer", local_answer);
-  gst_webrtc_session_description_free(local_answer);
-  gst_promise_unref(promise);
-}
-
 static void handle_sdp(int u, JsonObject *sdp_json) {
   // C-3：字段缺失/类型不符时直接丢弃，绝不把 NULL 交给下层
   // （原实现用 json_object_get_string_member 取缺失成员会得到 NULL，
@@ -168,7 +178,7 @@ static void handle_sdp(int u, JsonObject *sdp_json) {
   // answer。收到远端 offer 属于 glare：此时 webrtcbin 处于 have-local-offer，
   // 而它不支持 rollback，强行 set-remote-description(offer) 再 create-answer 会命中
   // gstwebrtcbin.c 的 unreachable 分支并 SIGSEGV —— 任意 viewer 都能借此 DoS
-  // （实测可复现）。下方的 create-answer 分支因此仅在协商方向改变时才会用到。
+  // （实测可复现）。前端只 createAnswer（见 html/script.js），故不会走到这里。
   if (g_strcmp0(type, "answer") != 0) {
     std::cerr << "signalling: 忽略远端 " << type
               << "（本端为 offerer，仅接受 answer）" << std::endl;
@@ -189,26 +199,14 @@ static void handle_sdp(int u, JsonObject *sdp_json) {
     return;
   }
 
-  gboolean is_answer = (g_strcmp0(type, "answer") == 0);
-  GstWebRTCSDPType sdp_type =
-      is_answer ? GST_WEBRTC_SDP_TYPE_ANSWER : GST_WEBRTC_SDP_TYPE_OFFER;
-
   GstWebRTCSessionDescription *desc =
-      gst_webrtc_session_description_new(sdp_type, sdp);
+      gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
 
   GstPromise *set_remote_promise = gst_promise_new_with_change_func(
       on_set_description_promise_result, (gpointer) "set-remote-description",
       nullptr);
   g_signal_emit_by_name(session(u).webrtcbin, "set-remote-description", desc,
                         set_remote_promise);
-
-  if (!is_answer) {
-    // 异步创建 answer，不阻塞 glib 主循环
-    GstPromise *promise = gst_promise_new_with_change_func(
-        on_create_answer_promise_done, GINT_TO_POINTER(u), nullptr);
-    g_signal_emit_by_name(session(u).webrtcbin, "create-answer", nullptr,
-                          promise);
-  }
 
   gst_webrtc_session_description_free(desc);
 }
@@ -279,7 +277,7 @@ static void handle_json_message(int u, const gchar *text) {
 
   JsonObject *obj = json_node_get_object(root);
 
-  // input 消息已在 on_ws_message 快速通道中处理，这里不再进入
+  // input 消息已在 on_peer_message 快速通道中处理，这里不再进入
   // 保留分支以防从其他路径到达
   if (json_object_has_member(obj, "input")) {
     JsonObject *input = json_object_get_object_member(obj, "input");
@@ -324,99 +322,20 @@ static void handle_json_message(int u, const gchar *text) {
   g_object_unref(parser);
 }
 
-// ======================== WebSocket 事件回调 ========================
-
-static void on_ws_message(SoupWebsocketConnection *,
-                          SoupWebsocketDataType /*type*/, GBytes *message,
-                          gpointer data) {
-  int u = GPOINTER_TO_INT(data);
-  UserSession &s = session(u);
-  gsize size = 0;
-  const gchar *data_bytes = (const gchar *)g_bytes_get_data(message, &size);
-  std::string msg(data_bytes, size);
-
-  if (msg.rfind("HELLO", 0) == 0) {
-    std::cout << "RECV: " << msg << std::endl;
-    if (!s.session_started) {
-      send_text(u, "SESSION " + s.viewer_id);
-      s.session_started = true;
-      // 握手完成后强制重新协商，保证无论哪一端先启动都能重新发出 offer，
-      // 覆盖“先开 sender 后开浏览器 / sender 单独重连”等所有时序。
-      // 同样遵循“先停 shm 读线程 → 重建管线 → 重启 shm 读线程”的顺序，消除竞态。
-      stop_shm_frame_reader(u);
-      stop_pipeline(u);
-      start_pipeline(u);
-      start_shm_frame_reader(u);
-    }
+// ======================== 浏览器 → 本端（本地对端入口）========================
+// 信令服务把 viewer_<u> 发来的消息经此回调投递进来。调用发生在 WS 处理线程
+// （主循环），因此可以直接操作管线与会话状态。
+static void on_peer_message(int u, const std::string &msg) {
+  if (msg.empty() || msg[0] != '{') {
+    // ASSIGN/SESSION/PING 等协议控制消息只发给信令服务本身，不会转发到这里。
     return;
   }
-
-  if (msg.rfind("SESSION_OK", 0) == 0) {
+  // 输入走快速通道：跳过 json-glib 解析，直接转发给 Godot
+  if (msg.rfind(R"({"input":)", 0) == 0) {
+    handle_input_message(u, msg);
     return;
   }
-
-  if (!msg.empty() && msg[0] == '{') {
-    // 输入消息走快速通道：跳过 json-glib 解析，直接转发给 Godot
-    if (msg.rfind(R"({"input":)", 0) == 0) {
-      handle_input_message(u, msg);
-      return;
-    }
-    handle_json_message(u, msg.c_str());
-  }
-}
-
-static void on_ws_closed(SoupWebsocketConnection *conn, gpointer data) {
-  int u = GPOINTER_TO_INT(data);
-  UserSession &s = session(u);
-  std::cout << "WebSocket closed" << std::endl;
-  if (conn) {
-    g_signal_handlers_disconnect_by_data(conn, nullptr);
-    g_object_unref(conn);
-  }
-  s.ws_conn = nullptr;
-  s.ws_handshake_done = false;
-  s.session_started = false;
-  if (!shutting_down.load()) {
-    schedule_signalling_reconnect(u);
-  }
-}
-
-static gboolean on_accept_certificate(SoupMessage *, GTlsCertificate *,
-                                      GTlsCertificateFlags tls_peer_errors,
-                                      gpointer) {
-  std::cerr << "Accepting localhost TLS certificate despite validation "
-               "errors: "
-            << static_cast<unsigned int>(tls_peer_errors) << std::endl;
-  return TRUE;
-}
-
-static void on_server_connected(GObject *, GAsyncResult *res,
-                                gpointer data) {
-  int u = GPOINTER_TO_INT(data);
-  UserSession &s = session(u);
-  GError *error = nullptr;
-
-  s.ws_conn = soup_session_websocket_connect_finish(soup_session, res, &error);
-  if (error) {
-    std::cerr << "WebSocket connect failed: " << error->message << std::endl;
-    g_error_free(error);
-    s.ws_conn = nullptr;
-    if (!shutting_down.load()) {
-      schedule_signalling_reconnect(u);
-    }
-    return;
-  }
-
-  std::cout << "WebSocket connected" << std::endl;
-  s.sign_reconnect_attempts = 0;
-  s.ws_handshake_done = true;
-
-  g_signal_connect(s.ws_conn, "message", G_CALLBACK(on_ws_message),
-                   GINT_TO_POINTER(u));
-  g_signal_connect(s.ws_conn, "closed", G_CALLBACK(on_ws_closed),
-                   GINT_TO_POINTER(u));
-
-  send_text(u, "HELLO " + s.sender_id);
+  handle_json_message(u, msg.c_str());
 }
 
 // ======================== 对外接口 ========================
@@ -428,91 +347,10 @@ void connect_webrtc_signals(GstElement *webrtc, int u) {
                    GINT_TO_POINTER(u));
 }
 
-// ======================== 信令连接 / 自动重连 ========================
-//
-// 设计目标：sender 不依赖信令服务器的启动顺序。
-// 任何时候连接失败或 WebSocket 断开，都不会退出进程，而是带退避地
-// 后台重连；握手完成后重新声明 SESSION 并强制重新协商，保证对端能接收 offer。
-
-static const unsigned SIGNAL_RECONNECT_MAX_DELAY_S = 30;
-
-// 调度一次带退避的重连（幂等：已有一个待触发的重连则忽略）
-static void schedule_signalling_reconnect(int u) {
+// 把该用户注册为信令服务的本地对端（id = sender_<u>）。
+// 必须在信令服务挂载之后调用。
+void signalling_start(int u) {
   UserSession &s = session(u);
-  if (shutting_down.load())
-    return;
-  if (s.sign_reconnect_source != 0)
-    return;
-
-  unsigned delay_s =
-      s.sign_reconnect_attempts >= 5
-          ? SIGNAL_RECONNECT_MAX_DELAY_S
-          : (1u << s.sign_reconnect_attempts); // 1,2,4,8,16 → 封顶 30s
-  s.sign_reconnect_attempts++;
-  std::cout << "Reconnecting to signalling server in " << delay_s << "s"
-            << std::endl;
-  s.sign_reconnect_source =
-      g_timeout_add_seconds(delay_s, try_connect_signalling, GINT_TO_POINTER(u));
-}
-
-static gboolean try_connect_signalling(gpointer data) {
-  int u = GPOINTER_TO_INT(data);
-  session(u).sign_reconnect_source = 0;
-  if (shutting_down.load())
-    return G_SOURCE_REMOVE;
-  start_signalling_connect(u);
-  return G_SOURCE_REMOVE;
-}
-
-void connect_to_signalling_server(int u) {
-  start_signalling_connect(u);
-}
-
-// 信令端点统一在 /ws（与前端使用的同源路径一致）。
-// 历史配置里的 signalling_url 往往只写到主机端口——原 Node 实现与路径无关，
-// 但内置信令服务是按路径挂载的（SoupServer 的 /ws），因此这里补全路径。
-static std::string signalling_endpoint_url() {
-  std::string url = g_config.signalling_url;
-  while (!url.empty() && url.back() == '/')
-    url.pop_back();
-  const auto scheme = url.find("://");
-  const auto search_from = (scheme == std::string::npos) ? 0 : scheme + 3;
-  if (url.find('/', search_from) == std::string::npos)
-    return url + "/ws";
-  return url; // 配置已显式给出路径，尊重之
-}
-
-static void start_signalling_connect(int u) {
-  UserSession &s = session(u);
-  if (shutting_down.load())
-    return;
-  if (s.ws_handshake_done)
-    return; // 已连接
-
-  if (!soup_session) {
-    GError *tls_error = nullptr;
-    GTlsDatabase *tls_db =
-        g_tls_file_database_new(g_config.signalling_ca_path.c_str(), &tls_error);
-    if (!tls_db) {
-      std::cerr << "Failed to load TLS CA file: " << g_config.signalling_ca_path
-                << " error=" << (tls_error ? tls_error->message : "unknown")
-                << std::endl;
-      if (tls_error)
-        g_error_free(tls_error);
-      schedule_signalling_reconnect(u);
-      return;
-    }
-    soup_session = soup_session_new();
-    soup_session_set_tls_database(soup_session, tls_db);
-    g_object_unref(tls_db);
-  }
-
-  const std::string endpoint = signalling_endpoint_url();
-  SoupMessage *msg = soup_message_new("GET", endpoint.c_str());
-  g_signal_connect(msg, "accept-certificate", G_CALLBACK(on_accept_certificate),
-                   nullptr);
-  soup_session_websocket_connect_async(soup_session, msg, nullptr, nullptr,
-                                       G_PRIORITY_DEFAULT, nullptr,
-                                       on_server_connected, GINT_TO_POINTER(u));
-  g_object_unref(msg);
+  signalling_server_register_local(
+      s.sender_id, [u](const std::string &msg) { on_peer_message(u, msg); });
 }

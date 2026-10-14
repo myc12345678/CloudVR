@@ -38,16 +38,14 @@ struct Config {
   bool godot_launch = false; // 是否由 C++ 自动启动 Godot（false=手动启动，兼容旧流程）
   bool godot_set_prime_env = true; // 启动 Godot 时是否注入 NVIDIA PRIME 环境变量
 
-  // ---- Signalling (WebSocket) ----
-  std::string self_id = "cpp_sender"; // 旧键（单用户）
-  std::string peer_id = "browser";    // 旧键（单用户）
-  // 多用户 id 模板（后续阶段按用户索引 u 展开；旧键 self_id/peer_id 届时退场）
+  // ---- Signalling ----
+  // 信令已并入本进程（本地对端），因此不再有"信令服务器地址 / CA 证书"这类
+  // 客户端配置；socket 配置只剩下面 http 段的监听地址与 TLS。
+  // 逐用户 id 由模板按索引 u 展开。
   std::string sender_id_template = "sender_{index}";
   std::string viewer_id_template = "viewer_{index}";
-  std::string signalling_url = "wss://127.0.0.1:8443";
-  std::string signalling_ca_path;
 
-  // ---- HTTP / 静态资源 / TLS（P2：替代 nginx，后续并入信令成为唯一对外入口）----
+  // ---- HTTP / 静态资源 / TLS ----
   //   - 合并完成后 8443 是唯一对外端口：页面 + /config.json + /ws 都在这里
   //   - /config.json 只暴露白名单字段（见 http_server 的公开配置生成逻辑）
   //   - 证书/私钥属于敏感字段，支持用环境变量覆盖（见 apply_env_overrides）

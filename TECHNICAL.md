@@ -63,29 +63,22 @@
 │         │   └──────────────────────┬──────────────────────────┘     │
 │         │                          │                                 │
 │         │   ┌──────────────────────▼──────────────────────────┐     │
-│         │   │           signalling.cpp                          │     │
-│         │   │  WebSocket (WSS) ↔ Signalling Server             │     │
-│         │   │  SDP Offer/Answer + ICE Candidate 交换           │     │
-│         │   │  input 消息快速通道 → send_to_godot()            │     │
+│         │   │     signalling.cpp（会话侧信令处理）                │     │
+│         │   │  本地对端回调 ↔ 内置信令服务（同进程，无 socket）    │     │
+│         │   │  SDP Offer/Answer + ICE Candidate 交换            │     │
+│         │   │  input 消息快速通道 → send_to_godot()             │     │
+│         │   └──────────────────────┬──────────────────────────┘     │
+│         │                          │                                │
+│         │   ┌──────────────────────▼──────────────────────────┐     │
+│         │   │    内置信令服务（SoupServer /ws，同一进程）         │     │
+│         │   │  槽位分配 ASSIGN ／ 注册 HELLO ／ 配对 SESSION      │     │
+│         │   │  中继 {"sdp"…} {"ice"…} {"input"…} → 对端          │     │
+│         │   │  安全: viewer_k↔sender_k、Origin 校验、帧长上限     │     │
 │         │   └──────────────────────┬──────────────────────────┘     │
 └─────────┼──────────────────────────┼────────────────────────────────┘
           │                          │
-          │              WSS (WebRTC 信令 + 输入消息)
+          │   WSS（信令 + 输入消息） + UDP 媒体流（ICE：浏览器↔webrtcbin）
           │                          │
-┌─────────▼──────────────────────────▼────────────────────────────────┐
-│              内置信令服务（在 webrtc_sender 进程内）                   │
-│                                                                      │
-│   SoupServer /ws（libsoup 负责 TLS / WS 握手与分帧）                  │
-│                                                                      │
-│   ┌─────────────────────────────────────────────────────────────┐   │
-│   │  槽位分配:     ASSIGN → ASSIGNED <k>                          │   │
-│   │  客户端注册:   HELLO <id> → HELLO_OK                          │   │
-│   │  会话建立:     SESSION <peer_id> → SESSION_OK                 │   │
-│   │  信令转发:     {"sdp":…} / {"ice":…} / {"input":…} → 对端      │   │
-│   │  安全: 强制 viewer_k↔sender_k 配对、Origin 校验、帧长上限      │   │
-│   └─────────────────────────────────────────────────────────────┘   │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           │
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │                      Browser 前端                                    │
 │                                                                      │
@@ -166,7 +159,6 @@ config.json
 | `godot.project_path` | Godot 项目目录（C++ 启动子进程用） | /path/to/Godot/test |
 | `godot.binary` / `launch` / `set_prime_env` | Godot 可执行文件 / 是否由 C++ 自动启动 / 是否注入 PRIME 环境变量 | godot / true / true |
 | `gstreamer.id_template.sender` / `.viewer` | 每用户信令 id 模板（`{index}` 展开为 u） | sender_{index} / viewer_{index} |
-| `gstreamer.signalling_url` | 内置信令服务 WSS 地址（须与 `http.port` 同端口） | wss://127.0.0.1:8443 |
 | `encoding.type` | 编码器类型 | nvenc / vp8_sw |
 | `encoding.encoder` | GStreamer 编码器元素名 | nvautogpuh264enc |
 | `encoding.bitrate_kbps` | 编码码率 (kbps) | 15000 |
@@ -174,8 +166,9 @@ config.json
 | `encoding.rate_control` | 码率控制模式 | cbr |
 | `shm.path_template` | 共享内存路径模板（`{index}` 展开为全局用户索引） | /dev/shm/godot_webrtc_frame_{index} |
 
-> 旧键 `godot.tcp_port`、`gstreamer.self_id/peer_id`、`shm.path` 暂保留用于向后兼容，
-> 代码已切换到新键读取，旧键彻底移除待后续清理。
+> `gstreamer.signalling_url` / `signalling_ca_path` / `self_id` / `peer_id` 已随
+> 信令客户端一并移除（信令改为进程内本地对端，不再需要地址与 CA）。
+> 旧键 `godot.tcp_port`、`shm.path` 暂保留用于向后兼容，代码已切到新键读取。
 
 ### 3.2 GStreamer 发送端 (C++)
 
@@ -686,6 +679,34 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
 等效于旧的手动 `run_godot.sh`。
 
 ---
+
+### 5.8 为什么把信令服务放进发送端进程？
+
+**WebRTC 本身不规定信令**。RFC 8825 明确：
+
+> The choice of protocols for client-server and inter-server signaling, and the
+> definition of the translation between them, are **outside the scope** of the
+> WebRTC protocol suite described in this document.
+
+因此"信令是否独立进程"纯粹是工程取舍。本项目选择**同进程**：
+
+- 单机部署（一台机器 ≤16 用户），浏览器与 sender 同机，不存在跨机 rendezvous 需求；
+- 少一跳回环 WSS，少一个进程要管；
+- 顺带消除 S-1：不再有客户端 TLS，也就没有"无条件接受服务器证书"的回调。
+
+同进程带来的两个必须注意的点（否则会踩坑）：
+
+1. **线程归属**：libsoup3 的线程安全**仅覆盖"发送消息"一类 API**，其余 API 必须在
+   创建对象的线程使用，而信令服务的 SoupServer 在主循环创建。webrtcbin 的
+   `on-ice-candidate` 却由 libnice 线程发出，因此外发统一经 `g_main_context_invoke`
+   marshal 回主循环（见 `signalling.cpp::send_text`）。这是审计 A-6 记录的项，
+   **与"信令是否同进程"无关**——独立进程时同样存在。
+2. **阻塞会连坐**：信令处理与 webrtcbin 回调共享主循环，信令里任何阻塞操作会同时
+   卡住信令与媒体。故 `create-offer` / `create-answer` 一律走异步 GstPromise。
+
+**什么时候必须拆开**：多台 GPU 机器 + 一个中心入口时，浏览器需要"问中心我该连哪台"，
+此时信令是**跨机 rendezvous**，必须是独立服务（这正是早期 Node 实现存在的合理场景）。
+届时应把 `signalling_server_*` 抽成独立可执行文件，并恢复 sender 侧的 WS 客户端。
 
 ## 6. 文件索引
 

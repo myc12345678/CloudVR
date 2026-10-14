@@ -64,13 +64,12 @@ cd ../..
 ```
 http_server: 已启动，web_root=html 入口页=test.html https://0.0.0.0:8443/
 signalling: 内置信令服务已挂载 /ws
-信令: 内置服务监听 8443，sender 客户端连接 wss://127.0.0.1:8443
-signalling: HELLO sender_0 / sender_1 / sender_2
+信令: 内置信令服务监听 8443（/ws），sender 侧为进程内本地对端
+signalling: 本地对端已注册 sender_0 / sender_1 / sender_2
 ```
 
-> 第三行若出现"端口不一致"的告警，会导致**页面能打开但拿不到视频流**
-> （sender 未注册为 `sender_<k>`），请按告警提示修正
-> `gstreamer.signalling_url`（应与 `http.port` 同端口）。
+> 关键自检：出现 `本地对端已注册 sender_<k>` 才说明浏览器能拿到流。缺少它会导致
+> **页面能打开、ASSIGN/SESSION 都成功，但永远收不到 offer**。
 
 该进程同时负责：
 
@@ -315,8 +314,7 @@ python3 tests/test_signalling.py
 ```
 
 脚本会从**仓库根的 `config.json`** 读取 `http.port` 与 `concurrency.max_users`，
-而不是写死端口——这样「配置与实际不符」这类问题（例如 `signalling_url` 指错端口
-导致 sender 未注册、浏览器拿不到流）会被测试直接暴露。
+而不是写死端口——这样「配置与实际不符」会被测试直接暴露，而不是等打开浏览器才发现黑屏。
 
 覆盖内容：
 

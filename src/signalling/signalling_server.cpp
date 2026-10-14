@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,11 @@ struct Client {
 
 // id → Client。仅登记"已完成 HELLO/ASSIGN"的连接，即槽位占用表。
 std::unordered_map<std::string, Client *> g_clients;
+
+// id → 进程内回调（本地对端，如 sender_<u>）。与 g_clients 互斥：
+// 同一个 id 不会既是 WS 连接又是本地对端。
+std::unordered_map<std::string, SignallingLocalSink> g_local_peers;
+
 SoupServer *g_attached = nullptr;
 
 constexpr const char *kClientDataKey = "cloudvr-signalling-client";
@@ -160,6 +166,15 @@ void handle_hello(Client *c, const std::string &id) {
     }
   }
 
+  // N-01 同样适用于本地对端：sender_<u> 由进程内回调占用，不能被 HELLO 顶掉。
+  if (g_local_peers.find(id) != g_local_peers.end()) {
+    std::cout << "signalling: REJECT HELLO " << id << "（id 由本地对端占用）"
+              << std::endl;
+    send_text(c, "REJECT id_taken");
+    close_with(c, SOUP_WEBSOCKET_CLOSE_POLICY_VIOLATION, "id taken");
+    return;
+  }
+
   const auto existing = g_clients.find(id);
   if (existing != g_clients.end() && existing->second != c) {
     std::cout << "signalling: REJECT HELLO " << id << "（id 已被占用）"
@@ -209,8 +224,16 @@ void handle_session(Client *c, const std::string &peer_id) {
 }
 
 // 原样转发给 peer。不打印正文（S-4：SDP/ICE 含内网地址与指纹）。
+// 转发给对端：本地对端（进程内回调）优先，其次才是 WS 连接。
 void relay_to_peer(Client *c, const std::string &payload) {
   if (c->peer_id.empty()) return;
+
+  const auto local = g_local_peers.find(c->peer_id);
+  if (local != g_local_peers.end() && local->second) {
+    local->second(payload);
+    return;
+  }
+
   const auto peer = g_clients.find(c->peer_id);
   if (peer == g_clients.end() || peer->second == nullptr) return;
   soup_websocket_connection_send_text(peer->second->conn, payload.c_str());
@@ -342,6 +365,32 @@ void signalling_server_attach(SoupServer *server) {
   std::cout << "signalling: 内置信令服务已挂载 /ws" << std::endl;
 }
 
+void signalling_server_register_local(const std::string &id,
+                                      SignallingLocalSink sink) {
+  if (id.empty() || !sink) return;
+  g_local_peers[id] = std::move(sink);
+  std::cout << "signalling: 本地对端已注册 " << id << std::endl;
+}
+
+void signalling_server_unregister_local(const std::string &id) {
+  g_local_peers.erase(id);
+}
+
+bool signalling_server_send_to(const std::string &id, const std::string &text) {
+  if (id.empty()) return false;
+
+  const auto local = g_local_peers.find(id);
+  if (local != g_local_peers.end() && local->second) {
+    local->second(text);
+    return true;
+  }
+
+  const auto peer = g_clients.find(id);
+  if (peer == g_clients.end() || peer->second == nullptr) return false;
+  soup_websocket_connection_send_text(peer->second->conn, text.c_str());
+  return true;
+}
+
 void signalling_server_detach() {
   if (g_attached == nullptr) return;
   for (auto &entry : g_clients) {
@@ -352,6 +401,7 @@ void signalling_server_detach() {
     }
   }
   g_clients.clear();
+  g_local_peers.clear();
   g_attached = nullptr;
   std::cout << "signalling: 内置信令服务已卸载" << std::endl;
 }

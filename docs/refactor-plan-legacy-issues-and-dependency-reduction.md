@@ -154,7 +154,7 @@
 
 | 编号 | 标题 | 证据 | 影响 | 修复建议 |
 |---|---|---|---|---|
-| L-30 | **信令 WebSocket 客户端接受任意证书** | `src/signalling/signalling.cpp:347-352`：`on_accept_certificate` 打印 "Accepting … despite validation" 并接受；`:443-455` 虽加载 CA 库但被覆盖 | 中间人可劫持信令 → 可注入 SDP/ICE | 去掉 accept-all 回调，信任 `signalling_ca_path`；仅开发模式显式开关 |
+| L-30 | ~~**信令 WebSocket 客户端接受任意证书**~~ **✅ 已解决** | `src/signalling/signalling.cpp:347-352`：`on_accept_certificate` 打印 "Accepting … despite validation" 并接受；`:443-455` 虽加载 CA 库但被覆盖 | 中间人可劫持信令 → 可注入 SDP/ICE | ✅ **随信令客户端整体移除而消除**：信令改为进程内本地对端（`signalling_server_register_local`），不再有客户端 TLS，`signalling_ca_path`/`signalling_url` 配置项一并删除（commit 见 git 历史） |
 | L-31 | **信令无认证/授权，可劫持他人会话槽位** | `signalling-server/server.js:242-260`：`HELLO <id>` 只校验索引 `< MAX_USERS`，随后 **无条件 `clients.set(id, state)` 覆盖已有槽位**；`:264-268` 的 `SESSION <peer_id>` 亦无任何约束 | ✅ 实测（读码） | 任意客户端发 `HELLO viewer_0` 即可顶掉该观众，再 `SESSION sender_0` 接收他人视频流 / 注入 SDP·ICE | 引入一次性 ASSIGN 票据或共享令牌；`HELLO` 拒绝已占用的 id（改用 `ASSIGN` 为唯一入口）；`SESSION` 校验对端白名单 |
 | L-32 | 输入通道无鉴权 | `src/transport/tcp_server.cpp` 无 token 校验 | 本机端口暴露即可注入输入 | 绑定回环 + 随机端口/令牌 |
 | **L-34** | **WebSocket 帧长无上限 + 无界缓冲 + O(n²) 拼接** | `signalling-server/server.js:59-60`（每 chunk `Buffer.concat`）、`:72-87`（只查高 32 位，`payloadLen` 可达 2^32-1） | 单连接声明超大帧即可耗尽内存/CPU 并阻塞事件循环（**最容易触发的 DoS**） | 设 `MAX_FRAME`/`MAX_BUFFER`（如 64 KB），超限 `close(1009)` |

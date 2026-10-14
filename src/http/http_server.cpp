@@ -50,8 +50,8 @@ void send_text(SoupServerMessage *msg, guint status, const char *reason,
 //
 // 前端只使用 concurrency.max_users（用于"槽位已满"提示，见 html/script.js），
 // 其余字段一律不下发：拓扑/编码参数、Godot 与证书路径、共享内存路径、
-// signalling_url、TLS 私钥路径等均属内部信息（原 nginx 直接 alias 整份
-// config.json，等于把这些全部暴露给任意访客）。
+// TLS 私钥路径等均属内部信息（原 nginx 直接 alias 整份 config.json，
+// 等于把这些全部暴露给任意访客）。
 //
 // 用 json-glib 构造而非字符串拼接：字段将来若有字符串类型，转义由库保证。
 std::string build_public_config() {
