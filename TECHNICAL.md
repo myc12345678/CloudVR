@@ -90,10 +90,10 @@
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │              前端入口（两种，当前阶段并存）                            │
 │                                                                      │
-│  A) webrtc_sender 内置 HTTP(S) —— 端口 8443                          │
+│  A) webrtc_sender 内置 HTTP(S) + 信令 —— 端口 8443                   │
 │     HTTPS :8443 → TLS 终端 + 静态文件 (config.http.web_root,          │
 │                   index test.html) + /config.json（白名单裁剪）        │
-│     /ws         → 尚未接入（返回 501，待信令合并）                     │
+│     /ws         → 内置信令：槽位分配 / SDP·ICE 中继 / 输入转发          │
 │                                                                      │
 │  B) Nginx（旧入口，仍可用）—— 端口 8080 / 8444                        │
 │     HTTP  :8080 → 301 重定向到 HTTPS :8444                            │
@@ -575,7 +575,7 @@ node signalling-server/server.js &
 |---|---|
 | `/` | 从 `config.http.web_root`（默认 `html`）读取静态资源；`/` 映射到 `index`（`test.html`） |
 | `/config.json` | 返回**白名单裁剪**的公开配置（当前仅 `concurrency.max_users`） |
-| `/ws` | 信令 WebSocket —— **尚未接入**，返回 `501`（待 P3 合并 `signalling-server/`） |
+| `/ws` | 信令 WebSocket —— **已接入**（见 4.4b），替代 `signalling-server/server.js` |
 | 其他 | `404`；非白名单扩展名一律拒绝 |
 
 实现要点（均为踩过的坑/有意设计）：
@@ -599,6 +599,56 @@ node signalling-server/server.js &
 # 私钥不写进 config.json，部署时注入
 CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
 ```
+
+### 4.4b 内置信令服务（`src/signalling/signalling_server.cpp`）
+
+挂在同一个 SoupServer 的 `/ws` 上（libsoup 按最长路径前缀匹配，`/ws` 优先于 HTTP
+模块的 `/` 兜底处理器），替代 `signalling-server/server.js`。分帧/握手/TLS 由 libsoup
+负责，本模块只实现业务协议。
+
+**协议（与前端字节级兼容，前端零改动）**
+
+| 消息 | 响应 | 说明 |
+|---|---|---|
+| `ASSIGN` | `ASSIGNED <k>` / `ASSIGN_FAILED full <n>` / `ASSIGN_FAILED not_configured` | 分配最小空闲 viewer 槽位，失败即关闭 |
+| `HELLO <id>` | `HELLO_OK` / `REJECT max_users` / `REJECT id_taken` | 注册 id |
+| `SESSION <peer>` | `SESSION_OK` / `REJECT session_pair` | 指定对端（强制 `viewer_k ↔ sender_k`） |
+| `PING` | `PONG` | 心跳 |
+| 其它 `{...}` | 原样转发给 peer | SDP / ICE / `{"input":…}` / `{"reset":true}` |
+
+**相对 Node 实现修正的问题**
+
+| 编号 | 问题 | 修正 |
+|---|---|---|
+| N-01 | `HELLO` 无条件 `clients.set(id,…)` → 可顶掉他人会话（实测可劫持） | id 已被活跃连接占用即 `REJECT id_taken` 并关闭 |
+| N-02 | `SESSION` 无归属校验 → viewer_0 可操作 sender_1 的玩家 | 强制同索引配对，错配即 `REJECT session_pair` |
+| N-03 | 单帧长度无上限 → 内存/CPU 耗尽 | 超 256 KiB 按 `TOO_BIG(1009)` 关闭 |
+| N-05 | 无心跳，半开连接永久占槽 | 启用 WS keepalive(30s)；关闭时立即释放槽位 |
+| S-01 | 无 Origin 校验 → 跨站可连（CSWSH） | Origin 的 host 必须与请求 Host 的 host 一致（忽略端口，兼容迁移期 8443/8444 并存） |
+| S-4 | 日志打印完整 SDP/ICE（含内网 IP、指纹） | 只记录事件，不打印消息正文 |
+
+**三个踩过的坑（务必保留注释）**
+
+1. **必须自行持有连接引用**：libsoup 在 WS 回调返回后会 `g_object_unref(conn)`。
+   若不 `g_object_ref()`，连接会在回调结束时被销毁——现象是「客户端握手成功(101)
+   但立刻断开，且 `message`/`closed` 信号永不触发」，极难定位。释放放在 `closed`
+   信号的 idle 回调里，避免在对象自身信号处理器内销毁它。
+2. **Origin 必须从请求头读**：`soup_websocket_connection_get_origin()` 在服务端连接上
+   返回 NULL，依赖它会**静默放行所有来源**（实测 `Origin: https://evil.example` 也能连上）。
+3. **TLS 必须显式传 `SOUP_SERVER_LISTEN_HTTPS`**（见 4.4）。
+
+**验证（`/tmp/sigtest.py`，15/15 通过）**
+
+- 正向：ASSIGN→`ASSIGNED 0`；SESSION→`SESSION_OK`；PING→PONG
+- 中继双向：viewer 发 `{"reset":true}` → **0.35s 后收到 sender 的 SDP offer**；
+  viewer 发的 SDP/ICE 确实到达 sender（其守卫日志可证）
+- 负向：N-01/N-02/N-03/S-01/槽位耗尽 全部按预期拒绝
+- 崩溃回归：把 offer 回灌给 sender（glare）与发送字段缺失的消息，**不再打死进程**
+  —— 修复前这会命中 `gstwebrtcbin.c` 的 unreachable 分支并 SIGSEGV（任意 viewer 可 DoS）
+
+> 相关的既有崩溃已一并修复：`handle_sdp` 缺字段时 `strlen(NULL)`、`handle_ice` 对
+> NULL `candidate` 做 `operator<<`、以及在 `have-local-offer` 状态下强行处理远端 offer。
+> 本端固定为 offerer（前端只 `createAnswer`），因此远端 offer 一律忽略。
 
 ### 4.5 配置调整
 

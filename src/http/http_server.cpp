@@ -232,3 +232,5 @@ void stop_http_server() {
   g_http_server = nullptr;
   std::cout << "http_server: 已停止" << std::endl;
 }
+
+SoupServer *http_server_get() { return g_http_server; }

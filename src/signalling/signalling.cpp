@@ -149,8 +149,31 @@ static void on_create_answer_promise_done(GstPromise *promise,
 }
 
 static void handle_sdp(int u, JsonObject *sdp_json) {
+  // C-3：字段缺失/类型不符时直接丢弃，绝不把 NULL 交给下层
+  // （原实现用 json_object_get_string_member 取缺失成员会得到 NULL，
+  //  随后 strlen(NULL) 立即段错误——任意对端一条消息即可打死 sender）
+  if (!json_object_has_member(sdp_json, "type") ||
+      !json_object_has_member(sdp_json, "sdp")) {
+    std::cerr << "signalling: 忽略缺少 type/sdp 字段的 SDP 消息" << std::endl;
+    return;
+  }
   const gchar *type = json_object_get_string_member(sdp_json, "type");
   const gchar *sdp_str = json_object_get_string_member(sdp_json, "sdp");
+  if (type == nullptr || sdp_str == nullptr) {
+    std::cerr << "signalling: 忽略字段类型非法的 SDP 消息" << std::endl;
+    return;
+  }
+
+  // 本项目的协商方向固定为「sender 发起 offer，浏览器回 answer」，因此这里只接受
+  // answer。收到远端 offer 属于 glare：此时 webrtcbin 处于 have-local-offer，
+  // 而它不支持 rollback，强行 set-remote-description(offer) 再 create-answer 会命中
+  // gstwebrtcbin.c 的 unreachable 分支并 SIGSEGV —— 任意 viewer 都能借此 DoS
+  // （实测可复现）。下方的 create-answer 分支因此仅在协商方向改变时才会用到。
+  if (g_strcmp0(type, "answer") != 0) {
+    std::cerr << "signalling: 忽略远端 " << type
+              << "（本端为 offerer，仅接受 answer）" << std::endl;
+    return;
+  }
 
   GstSDPMessage *sdp = nullptr;
 
@@ -191,10 +214,24 @@ static void handle_sdp(int u, JsonObject *sdp_json) {
 }
 
 static void handle_ice(int u, JsonObject *ice_json) {
-  guint sdpMLineIndex = json_object_get_int_member(ice_json, "sdpMLineIndex");
+  // C-3：candidate 缺失/非字符串时不能直接打印（对 NULL 做 operator<< 是 UB），
+  // 也要避免把 NULL 传给 webrtcbin。
+  if (!json_object_has_member(ice_json, "candidate")) {
+    std::cerr << "signalling: 忽略缺少 candidate 的 ICE 消息" << std::endl;
+    return;
+  }
   const gchar *candidate = json_object_get_string_member(ice_json, "candidate");
+  if (candidate == nullptr) {
+    std::cerr << "signalling: 忽略 candidate 类型非法的 ICE 消息" << std::endl;
+    return;
+  }
 
-  std::cout << "Remote ICE candidate: " << candidate << std::endl;
+  guint sdpMLineIndex = 0;
+  if (json_object_has_member(ice_json, "sdpMLineIndex")) {
+    const gint64 index = json_object_get_int_member(ice_json, "sdpMLineIndex");
+    if (index >= 0) sdpMLineIndex = static_cast<guint>(index);
+  }
+
   g_signal_emit_by_name(session(u).webrtcbin, "add-ice-candidate",
                         sdpMLineIndex, candidate);
 }
@@ -431,6 +468,20 @@ void connect_to_signalling_server(int u) {
   start_signalling_connect(u);
 }
 
+// 信令端点统一在 /ws（与前端使用的同源路径一致）。
+// 历史配置里的 signalling_url 往往只写到主机端口——原 Node 实现与路径无关，
+// 但内置信令服务是按路径挂载的（SoupServer 的 /ws），因此这里补全路径。
+static std::string signalling_endpoint_url() {
+  std::string url = g_config.signalling_url;
+  while (!url.empty() && url.back() == '/')
+    url.pop_back();
+  const auto scheme = url.find("://");
+  const auto search_from = (scheme == std::string::npos) ? 0 : scheme + 3;
+  if (url.find('/', search_from) == std::string::npos)
+    return url + "/ws";
+  return url; // 配置已显式给出路径，尊重之
+}
+
 static void start_signalling_connect(int u) {
   UserSession &s = session(u);
   if (shutting_down.load())
@@ -456,7 +507,8 @@ static void start_signalling_connect(int u) {
     g_object_unref(tls_db);
   }
 
-  SoupMessage *msg = soup_message_new("GET", g_config.signalling_url.c_str());
+  const std::string endpoint = signalling_endpoint_url();
+  SoupMessage *msg = soup_message_new("GET", endpoint.c_str());
   g_signal_connect(msg, "accept-certificate", G_CALLBACK(on_accept_certificate),
                    nullptr);
   soup_session_websocket_connect_async(soup_session, msg, nullptr, nullptr,

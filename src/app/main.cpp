@@ -11,6 +11,7 @@
 #include "encode/pipeline.h"
 #include "http/http_server.h"
 #include "signalling/signalling.h"
+#include "signalling/signalling_server.h"
 #include "transport/tcp_server.h"
 
 static void on_signal(int /*signum*/) {
@@ -98,7 +99,11 @@ int main(int argc, char *argv[]) {
 
   // ---- 启动内置 HTTP(S) 服务（P2：替代 nginx）----
   // 失败不阻断视频链路（信令/编码与 Web 服务相互独立），仅打印明确原因。
-  if (!start_http_server()) {
+  if (start_http_server()) {
+    // P3：把内置信令服务挂到同一个 SoupServer 的 /ws 上
+    // （libsoup 按最长路径前缀匹配，/ws 优先于 HTTP 模块的 "/" 兜底处理器）
+    signalling_server_attach(http_server_get());
+  } else {
     std::cerr << "警告: 内置 HTTP 服务未启动；页面/配置请暂用 nginx 入口" << std::endl;
   }
 
@@ -124,6 +129,7 @@ int main(int argc, char *argv[]) {
 
   // ---- 逐 GPU / 逐用户清理 ----
   // 先关停 Godot 子进程（停止写帧），再清理读取端
+  signalling_server_detach();
   stop_http_server();
   stop_godot_processes();
   for (int g = 0; g < g_config.gpu_count; ++g) {

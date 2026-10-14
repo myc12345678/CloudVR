@@ -1,6 +1,9 @@
 #ifndef HTTP_SERVER_H
 #define HTTP_SERVER_H
 
+// libsoup 的 SoupServer 前向声明（避免头文件把 libsoup 传染给调用方）
+typedef struct _SoupServer SoupServer;
+
 // ======================== 内置 HTTP(S) 服务（P2：替代 nginx）=======================
 // 在 config.http_port（默认 8443）上提供：
 //   - 静态资源：从 config.http_web_root 读取前端文件（"/" → index，默认 test.html）
@@ -20,5 +23,10 @@ bool start_http_server();
 
 // 停止服务并释放资源，幂等。
 void stop_http_server();
+
+// 取底层 SoupServer（未启动时返回 nullptr）。
+// 供其它模块挂载更具体路径的处理器使用——例如信令模块挂 /ws
+// （libsoup 按最长路径前缀匹配，"/ws" 会优先于本模块的 "/" 兜底处理器）。
+SoupServer *http_server_get();
 
 #endif // HTTP_SERVER_H

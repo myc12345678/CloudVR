@@ -68,12 +68,13 @@ cd signalling-server && node server.js
 # 2) sender（自动 fork/exec 启动 Godot、注入 PRIME 环境变量、并在 8443 提供前端页面）
 ./build/webrtc_sender                        # 从仓库根目录运行（会读到 ./config.json）
 
-# 3)（当前阶段需要）nginx —— 因为 8443 的 /ws 尚未接入，完整会话仍走 8444
+# 3)（可选）nginx —— 旧入口，与 8443 并存，便于对照
 nginx -c "$(pwd)/html/nginx.conf"
 ```
 
-> 待信令合并进 `src/` 后，第 1、3 步都会消失：只跑 `./build/webrtc_sender`，
-> 浏览器直接访问 `https://127.0.0.1:8443/`。
+> 内置 HTTP 服务已包含完整信令（`/ws`），**第 1、3 步都已不再必需**：
+> 只跑 `./build/webrtc_sender`，浏览器直接访问 `https://127.0.0.1:8443/` 即可。
+> Node 信令与 nginx 目前保留仅用于并存对照，验证无碍后即会移除。
 
 - Godot 子进程由 sender 监控，崩溃后自动指数退避重启（`1s→2s→…→30s`）。
 - sender 退出时会向 Godot 发 SIGTERM 优雅关停。
@@ -110,7 +111,8 @@ cd signalling-server && node server.js
 - `https://<ip>:8443/` 提供浏览器页面（`test.html`，从 `config.json` 的 `http.web_root` 读取）
 - `https://<ip>:8443/config.json` 提供**白名单裁剪后**的公开配置（仅 `concurrency.max_users`），
   不再像原先 nginx 那样把整份 `config.json`（含绝对路径、证书路径）暴露给访客
-- `https://<ip>:8443/ws` **尚未实现**（信令合并进行中，当前返回 `501`）
+- `https://<ip>:8443/ws` 提供**信令 WebSocket**（槽位分配 / SDP·ICE 中继 / 输入转发），
+  已由 `src/signalling/signalling_server.cpp` 内置实现，**不再需要 Node**
 
 **方式 2（旧，仍可用）：nginx —— HTTP 8080 → HTTPS 8444**
 
@@ -123,8 +125,8 @@ nginx -c "$(pwd)/html/nginx.conf"
 
 用 `nginx -t -c <conf>` 校验配置语法；用 `nginx -s reload -c <conf>` 重载。
 
-> **当前阶段（信令合并未完成）**：完整会话请走 **方式 2**（`8444`），因为 `8443` 的 `/ws`
-> 尚未接入。方式 1 目前可用于验证静态资源与公开配置。
+> **方式 1 已可独立完成完整会话**（页面 + 公开配置 + 信令）。
+> 方式 2 保留用于并存对照。
 
 ### 第 3 步：Godot（创建共享内存帧）
 
@@ -172,7 +174,7 @@ cd <仓库根目录> && ./build/webrtc_sender
 
 | 端口 | 服务 | 作用 |
 |------|------|------|
-| **8443** | **webrtc_sender 内置 HTTP(S)** | **浏览器前端页面 + `/config.json`（公开白名单）**；`/ws` 待合并完成后接入 |
+| **8443** | **webrtc_sender 内置 HTTP(S) + 信令** | **浏览器前端页面 + `/config.json`（公开白名单）+ `/ws` 信令（槽位分配 / SDP·ICE 中继 / 输入转发）**——单进程即可完成完整会话 |
 | 9443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 / 用户槽位分配（**回环地址**，仅本机可达） |
 | 8444 | nginx (HTTPS) | 旧入口：浏览器前端页面（与 8443 可并存对照） |
 | 8080 | nginx | 旧入口：HTTP，`301` 重定向到 8444 |
