@@ -1,4 +1,5 @@
 #include <csignal>
+#include <cstdlib>
 #include <gst/gst.h>
 #include <iostream>
 #include <libsoup/soup.h>
@@ -13,6 +14,19 @@
 #include "signalling/signalling.h"
 #include "signalling/signalling_server.h"
 #include "transport/tcp_server.h"
+
+// 从信令 URL 中取出端口（用于与内置信令服务端口做一致性校验）。
+static int signalling_url_port(const std::string &url) {
+  const auto scheme = url.find("://");
+  const auto start = (scheme == std::string::npos) ? 0 : scheme + 3;
+  const auto slash = url.find('/', start);
+  const std::string host_port = url.substr(
+      start, (slash == std::string::npos) ? std::string::npos : slash - start);
+  const auto colon = host_port.rfind(':');
+  if (colon == std::string::npos)
+    return url.rfind("wss", 0) == 0 ? 443 : 80;
+  return std::atoi(host_port.c_str() + colon + 1);
+}
 
 static void on_signal(int /*signum*/) {
   // 置位关停标志，停止所有后台重连定时器，并让主循环退出以走干净清理
@@ -103,6 +117,21 @@ int main(int argc, char *argv[]) {
     // P3：把内置信令服务挂到同一个 SoupServer 的 /ws 上
     // （libsoup 按最长路径前缀匹配，/ws 优先于 HTTP 模块的 "/" 兜底处理器）
     signalling_server_attach(http_server_get());
+
+    // 一致性校验：sender 自身的信令客户端连的是 signalling_url，而内置信令服务
+    // 监听 http.port。两者不一致时（且没有外部信令服务），sender 不会注册为
+    // sender_<k>，现象是「页面能打开、ASSIGN/SESSION 都成功，但永远拿不到 offer」。
+    // 这里显式告警，避免此类静默失配再次出现。
+    const int configured_port = signalling_url_port(g_config.signalling_url);
+    std::cout << "信令: 内置服务监听 " << g_config.http_port
+              << "，sender 客户端连接 " << g_config.signalling_url << std::endl;
+    if (configured_port != g_config.http_port) {
+      std::cerr << "警告: signalling_url 端口(" << configured_port
+                << ") 与内置信令服务端口(" << g_config.http_port
+                << ") 不一致。若未另行启动外部信令服务，浏览器将拿不到视频流；"
+                << "单进程部署请把 gstreamer.signalling_url 设为 wss://127.0.0.1:"
+                << g_config.http_port << std::endl;
+    }
   } else {
     std::cerr << "警告: 内置 HTTP 服务未启动；页面/配置请暂用 nginx 入口" << std::endl;
   }
