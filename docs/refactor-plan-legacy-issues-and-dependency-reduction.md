@@ -162,7 +162,7 @@
 | L-36 | ASSIGN 不校验对端 sender 是否在线 | `server.js:221-233` | 分配到无对端的槽位 → 黑屏且槽位虚占 | 分配需 `sender_k` 在线，或由 sender 预注册"就绪"槽位 |
 | L-37 | 自签证书是 **CA:TRUE**，SAN 与实际访问地址不符；私钥 `-nodes` 明文 | 实测 `openssl x509`：`basicConstraints=critical,CA:TRUE`、`keyUsage=keyCertSign`、SAN 仅 `IP:127.0.0.1,DNS:localhost`；`README.md:265-284` | 私钥泄露即可签发任意证书；换 IP/域名访问必然证书错误，并训练用户"点继续" | 改签**叶子证书（CA:FALSE）**，SAN 覆盖实际地址；私钥加口令 |
 | L-38 | 明文 `ws://` 回退无告警；无 Origin 校验（CSWSH）；无安全响应头 | `html/script.js:31-33` 按协议选择 ws/wss；`server.js:391-397` 只检查 upgrade 头；`html/nginx.conf` 全文无 `add_header` | 局域网任意主机/任意网页可抢槽位、注入输入 | 仅允许 wss + 校验 Origin 白名单 + 加 HSTS/CSP/X-Frame-Options |
-| L-33 | 私钥保护仅依赖 `.gitignore` | `.gitignore` 中 `signalling-server/certs/*` + `!dev-cert.pem` | 误提交风险 | 加 pre-commit 检查；生产改用非仓库路径 |
+| L-33 | 私钥保护仅依赖 `.gitignore` | `.gitignore` 中 `certs/*` + `!certs/dev-cert.pem` | 误提交风险 | 加 pre-commit 检查；生产改用非仓库路径 |
 
 ### 1.5 配置与文档遗留（P2）
 

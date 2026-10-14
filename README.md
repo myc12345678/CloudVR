@@ -7,9 +7,9 @@
 | 路径 | 内容 |
 |------|------|
 | `Godot/test/` | Godot 游戏引擎（GDScript + 场景），每玩家一个 SubViewport 独立渲染/捕获帧，接收反向输入（经 `NetworkInputRouter` → `PlayerInput` 分发给各玩家） |
-| `src/` | C++17 发送端（分模块）：`app`(入口/编排) `config`(运行时配置) `core`(会话/共享内存协议) `capture`(Godot 子进程) `transport`(Godot TCP 通道) `encode`(GStreamer 管线) `signalling`(信令 WS 客户端) **`http`(内置 HTTP/静态资源/TLS，替代 nginx)** `util`(全局状态) |
-| `signalling-server/` | Node.js（零依赖）WebSocket 信令中继 + 输入转发 + 用户槽位自动分配（**待并入 `src/`**） |
-| `html/` | 浏览器前端静态资源（WebRTC 接收端）+ 旧 nginx 配置 |
+| `src/` | C++17 服务端（分模块）：`app`(入口/编排) `config`(运行时配置) `core`(会话/共享内存协议) `capture`(Godot 子进程) `transport`(Godot TCP 通道) `encode`(GStreamer 管线) `signalling`(信令服务端 + 会话信令) `http`(HTTP/静态资源/TLS) `util`(全局状态) |
+| `html/` | 浏览器前端静态资源（WebRTC 接收端），由内置 HTTP 服务提供 |
+| `certs/` | TLS 证书：`dev-cert.pem` 入库，私钥 `dev-key.pem` 由 gitignore 排除 |
 | `scripts/` | `run_godot.sh`：强制用 NVIDIA 独显启动 Godot（旧的手动启动方式，现可由 C++ 自动启动替代） |
 | `docs/` | 设计文档，含 [多用户+多 GPU 架构](docs/multi-user-multi-gpu-design.md) 与 [GPU 零拷贝分析](docs/gpu-zero-copy-design.md) |
 
@@ -17,8 +17,6 @@
 
 | 组件 | 依赖 | 已验证版本 |
 |------|------|------|
-| `signalling-server` | Node.js（无需 npm 安装任何包） | v26 |
-| `html/`（nginx） | nginx | 1.31 |
 | `src/` | C++17（g++）+ CMake ≥3.16 + pkg-config、GStreamer ≥1.20（`gstreamer-webrtc`、`gstreamer-sdp`、`gstreamer-app`、`libsoup-3.0`、`json-glib-1.0`） | GStreamer 1.28 |
 | `Godot/test/` | Godot 4.x（Forward+ / Vulkan） | 4.7 |
 | 视频编码 | NVIDIA GPU + 驱动（NVENC 硬件编码，见 `config.json` 的 `encoding.type`） | RTX 4060 |
@@ -54,119 +52,56 @@ cd ../..
 系统支持**多用户**：每个用户一个浏览器标签页、一个 Godot 玩家实例、一路独立视频流。
 用户数量由 `config.json` 的 `topology` 与 `concurrency.max_users` 决定。
 
-启动方式有两种：
-
-### 方式 A：C++ 自动编排（推荐）
-
-`config.json` 中设 `godot.launch = true`，则由 `webrtc_sender` 自动启动 Godot 子进程。
-内置 HTTP 服务也随 sender 一起启动，因此**只需两个进程**（信令 + sender）：
+**现在只需启动一个进程**——`webrtc_sender` 自己提供信令服务、前端页面与公开配置，
+并按需拉起 Godot 子进程：
 
 ```bash
-# 1) 信令服务器（回环 9443）
-cd signalling-server && node server.js
-
-# 2) sender（自动 fork/exec 启动 Godot、注入 PRIME 环境变量、并在 8443 提供前端页面）
-./build/webrtc_sender                        # 从仓库根目录运行（会读到 ./config.json）
-
-# 3)（可选）nginx —— 旧入口，与 8443 并存，便于对照
-nginx -c "$(pwd)/html/nginx.conf"
+./build/webrtc_sender            # 从仓库根目录运行（会读到 ./config.json）
 ```
 
-> 内置 HTTP 服务已包含完整信令（`/ws`），**第 1、3 步都已不再必需**：
-> 只跑 `./build/webrtc_sender`，浏览器直接访问 `https://127.0.0.1:8443/` 即可。
-> Node 信令与 nginx 目前保留仅用于并存对照，验证无碍后即会移除。
+启动日志应出现（关键自检）：
 
-- Godot 子进程由 sender 监控，崩溃后自动指数退避重启（`1s→2s→…→30s`）。
-- sender 退出时会向 Godot 发 SIGTERM 优雅关停。
-- `godot.set_prime_env = true`（默认）时自动注入 `__NV_PRIME_RENDER_OFFLOAD=1` 等环境变量，
-  等效于旧的 `run_godot.sh`。
+```
+http_server: 已启动，web_root=html 入口页=test.html https://0.0.0.0:8443/
+signalling: 内置信令服务已挂载 /ws
+信令: 内置服务监听 8443，sender 客户端连接 wss://127.0.0.1:8443
+signalling: HELLO sender_0 / sender_1 / sender_2
+```
 
-### 方式 B：手动启动 Godot（旧流程）
+> 第三行若出现"端口不一致"的告警，会导致**页面能打开但拿不到视频流**
+> （sender 未注册为 `sender_<k>`），请按告警提示修正
+> `gstreamer.signalling_url`（应与 `http.port` 同端口）。
 
-`config.json` 中设 `godot.launch = false`（默认），则 Godot 需手动启动：
+该进程同时负责：
+
+- **信令服务**：`/ws` 上的用户槽位分配、SDP/ICE 中继、输入转发（`src/signalling/signalling_server.cpp`）
+- **前端与公开配置**：`https://<ip>:8443/` 提供页面；`/config.json` 只下发白名单字段
+- **Godot 子进程**：`godot.launch=true` 时 fork/exec 启动，崩溃后指数退避重启（`1s→…→30s`），
+  退出时 SIGTERM 优雅关停；`set_prime_env=true` 自动注入 PRIME 环境变量（等效旧的 `run_godot.sh`）
+- **拉流管线**：按 `max_users` 启动管线与共享内存读帧线程，按 GPU 启动 TCP 控制通道
+
+### 手动启动 Godot（可选）
+
+若把 `config.json` 的 `godot.launch` 设为 `false`，则 Godot 需自行启动：
 
 ```bash
 ./scripts/run_godot.sh            # 强制用 NVIDIA 独显启动
 ```
 
----
+### 浏览器
 
-### 第 1 步：信令服务器（wss://127.0.0.1:9443）
-
-```bash
-cd signalling-server && node server.js
-```
-日志出现 `Signalling server listening on wss://127.0.0.1:9443` 即为成功。
-（端口/绑定地址读自 `config.json` 的 `signalling_server`，改端口可设环境变量 `PORT`。）
-
-> **端口变更说明**：信令服务原先占 `8443` 并监听 `0.0.0.0`；该端口现已让给内置的
-> C++ HTTP 服务（见第 2 步），信令迁到**回环 `9443`**——顺带消除了它对外直接暴露的问题。
-
-### 第 2 步：前端入口（两种，可并存）
-
-**方式 1（新）：由 sender 内置的 C++ HTTP 服务提供 —— 端口 8443**
-
-随第 4 步的 `webrtc_sender` 一起启动，无需额外进程：
-
-- `https://<ip>:8443/` 提供浏览器页面（`test.html`，从 `config.json` 的 `http.web_root` 读取）
-- `https://<ip>:8443/config.json` 提供**白名单裁剪后**的公开配置（仅 `concurrency.max_users`），
-  不再像原先 nginx 那样把整份 `config.json`（含绝对路径、证书路径）暴露给访客
-- `https://<ip>:8443/ws` 提供**信令 WebSocket**（槽位分配 / SDP·ICE 中继 / 输入转发），
-  已由 `src/signalling/signalling_server.cpp` 内置实现，**不再需要 Node**
-
-**方式 2（旧，仍可用）：nginx —— HTTP 8080 → HTTPS 8444**
-
-```bash
-nginx -c "$(pwd)/html/nginx.conf"
-```
-- `http://<ip>:8080/` → `301` 重定向到 `https://<ip>:8444/`
-- `https://<ip>:8444/` 提供浏览器页面（`test.html`）
-- `https://<ip>:8444/ws` 反向代理到信令服务器 `https://127.0.0.1:9443`
-
-用 `nginx -t -c <conf>` 校验配置语法；用 `nginx -s reload -c <conf>` 重载。
-
-> **方式 1 已可独立完成完整会话**（页面 + 公开配置 + 信令）。
-> 方式 2 保留用于并存对照。
-
-### 第 3 步：Godot（创建共享内存帧）
-
-- **自动（推荐）**：`godot.launch=true`，由 sender 启动，无需手动操作。
-- **手动**：`./scripts/run_godot.sh`，强制用 NVIDIA 独显启动。
-
-每个 Godot 实例渲染 `players_per_gpu` 个玩家（每个玩家一个 SubViewport），
-写入 `/dev/shm/godot_webrtc_frame_<u>`（`u` 为全局用户索引，多 GPU 时为 `gpu*players_per_gpu+k`）。
-
-### 第 4 步：GStreamer 发送端（读取帧 → NVENC 编码 → WebRTC + 内置 HTTP 服务）
-
-```bash
-cd <仓库根目录> && ./build/webrtc_sender
-```
-- 按 `max_users` 启动对应数量的 GStreamer 管线与 shm 读取线程（零拷贝）
-- 按 GPU 启动 TCP 控制通道（端口 `tcp_port_base + gpu`），接收输入并带 `player` 索引转发
-- 每用户一对信令 id：`sender_<u>` ↔ `viewer_<u>`
-- **同时启动内置 HTTP(S) 服务**（默认 8443，见第 2 步方式 1）
-
-### 第 5 步：浏览器（WebRTC 接收端）
-
-用浏览器打开 `https://127.0.0.1:8444/`（方式 2）或 `https://127.0.0.1:8443/`（方式 1，
-需等 `/ws` 合并完成）。信令服务器会自动分配一个空闲用户槽位；
-当所有槽位已满时，页面显示"无法接入会话"错误页。
+打开 `https://127.0.0.1:8443/`（自签证书需点"继续前往"）。**无需任何 URL 参数**：
+信令服务会自动分配一个空闲用户槽位；槽位全满时页面显示"无法接入会话"错误页。
 
 ---
 
-### 启动顺序（已与先后解耦，无强制顺序）
+### 启动顺序（已与先后解耦）
 
-各组件**不依赖启动顺序**，可任意先后启动，均能自动衔接：
-
-- **共享内存帧**：`webrtc_sender` 的读帧线程会在 `/dev/shm/godot_webrtc_frame_<u>` 不存在时
-  每 1 秒重试打开。因此无论 Godot 先起还是 sender 先起，只要文件一出现，sender 就会
-  自动读取；Godot 运行中途重建该文件（分辨率变更 / 重启）也会被 sender 自动跟随
-  （限频约 1 秒检测一次 inode，发现变化即重新打开，无需重启 sender）。
-- **信令 WebSocket**：sender 在信令服务器未启动或中途断开时**不会退出**，而是按
-  `1s→2s→4s→…→30s` 退避在后台重连；重新连上后会自动重新声明会话并触发重新协商。
-  浏览器端本身就带指数退避重连。
+- **共享内存帧**：sender 的读帧线程在 `/dev/shm/godot_webrtc_frame_<u>` 不存在时每 1 秒重试打开；
+  Godot 中途重建该文件（分辨率变更 / 重启）也会被自动跟随（限频 inode 检测）。
+- **信令**：内置信令随 sender 一同启动，不再有跨进程连接与重连问题。
 - **TCP 控制通道**：Godot 每 2 秒重连 sender 的 TCP（`tcp_port_base + gpu`），天然无先后依赖。
-- **用户槽位**：浏览器关闭后其槽位自动释放，供下一个用户分配。
+- **用户槽位**：浏览器关闭后槽位立即释放，供下一个用户分配。
 
 ---
 
@@ -174,14 +109,11 @@ cd <仓库根目录> && ./build/webrtc_sender
 
 | 端口 | 服务 | 作用 |
 |------|------|------|
-| **8443** | **webrtc_sender 内置 HTTP(S) + 信令** | **浏览器前端页面 + `/config.json`（公开白名单）+ `/ws` 信令（槽位分配 / SDP·ICE 中继 / 输入转发）**——单进程即可完成完整会话 |
-| 9443 | signalling-server (WSS) | WebSocket 信令中继 / 输入转发 / 用户槽位分配（**回环地址**，仅本机可达） |
-| 8444 | nginx (HTTPS) | 旧入口：浏览器前端页面（与 8443 可并存对照） |
-| 8080 | nginx | 旧入口：HTTP，`301` 重定向到 8444 |
+| **8443** | **webrtc_sender（唯一对外端口）** | 浏览器页面 + `/config.json`（公开白名单）+ `/ws` 信令（槽位分配 / SDP·ICE 中继 / 输入转发） |
 | 9002 + gpu | webrtc_sender (TCP) | 每 GPU 一条，接收该 GPU 的 Godot 控制输入通道（单 GPU 为 9002） |
 
-> 迁移目标：信令并入 `webrtc_sender` 后，`8443` 将成为**唯一对外端口**，
-> nginx(8080/8444) 与 Node(9443) 一并退场——届时只需分发起一个可执行文件 + `config.json`。
+> 已收敛为**单进程 + 单对外端口**：Node 信令服务与 nginx 均已移除，
+> 部署只需一个可执行文件 + `config.json` + `certs/`。
 
 共享内存：`/dev/shm/godot_webrtc_frame_<u>`，每个用户一个文件（零拷贝帧传输，
 1920×1080 RGB8 = 6,220,800 字节 + 16 字节头）。`u` 为全局用户索引，多 GPU 时为
@@ -231,22 +163,16 @@ cd <仓库根目录> && ./build/webrtc_sender
 
 ## 关闭流程
 
-按启动的逆序关闭所有常驻进程，并清理共享内存：
+只需停掉一个进程，然后清理共享内存：
 
 ```bash
-# 1) 关闭 nginx（优雅停止 master + worker）
-nginx -s stop -c "$(pwd)/html/nginx.conf"
+# 1) 结束服务端（先 SIGTERM 优雅关停 Godot 子进程，再停管线与 HTTP/信令服务）
+pkill -x webrtc_sender 2>/dev/null || true
 
-# 2) 结束 Godot（run_godot.sh 前台运行时按 Ctrl+C 即可；否则按 PID 结束）
+# 2) 若 Godot 是手动启动的（godot.launch=false），单独结束它
 pkill -f '[g]odot --path' 2>/dev/null || true
 
-# 3) 结束 GStreamer 发送端
-pkill -f '[w]ebrtc_sender' 2>/dev/null || true
-
-# 4) 结束信令服务器
-pkill -f '[n]ode server\.js' 2>/dev/null || true
-
-# 5) 删除共享内存帧文件（下次启动会重新创建）
+# 3) 删除共享内存帧文件（下次启动会重新创建）
 rm -f /dev/shm/godot_webrtc_frame_*
 ```
 
@@ -254,17 +180,18 @@ rm -f /dev/shm/godot_webrtc_frame_*
 
 ```bash
 # 应无任何项目进程
-ps -eo pid,cmd | grep -E '[g]odot --path|[w]ebrtc_sender|[n]ode server\.js|[n]ginx:' | grep -v grep
+ps -eo pid,cmd | grep -E '[g]odot --path|[w]ebrtc_sender' | grep -v grep
 # 应无项目端口被占用
-ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
+ss -ltnp | grep -E ':8443|:9002' || echo "端口已释放"
 ```
 
-> 说明：`node server.js` / `webrtc_sender` / `godot` 若在前台终端运行，直接 `Ctrl+C`
-> 即可退出；上表用 `pkill` 是为了脚本化关闭。`/dev/shm` 里的是共享内存帧文件，
-> 退出后残留不影响下次启动（Godot 启动时会重新创建）。
+> `webrtc_sender` 若在前台运行，`Ctrl+C` 即可（会走优雅关停）。`/dev/shm` 中残留的
+> 帧文件不影响下次启动——Godot 启动时会重新创建，sender 也会自动跟随。
 >
-> 小贴士：上面 `pkill -f` 用 `[w]ebrtc_sender` 这类“字符类”写法，是为了让模式**不会匹配到
-> pkill 自身的命令行**（否则在 `bash -c` 或脚本里运行会把自己也 kill 掉）。请保留此写法。
+> ⚠️ **不要用模糊匹配杀进程**：`pkill -f webrtc_sender` 会匹配到**执行它的 shell 自身**
+> （命令行里含该字符串），把自己一起杀掉；同理 `pkill -x node` 可能误杀机器上其它 Node
+> 程序（本项目的 DSH/编辑器等）。推荐 `pkill -x webrtc_sender`（按进程名精确匹配）
+> 或先 `pgrep` 拿 PID 再按 PID 结束。
 
 ## 配置（机器相关，不入库）
 
@@ -275,17 +202,15 @@ ss -ltnp | grep -E ':8080|:8443|:8444|:9002' || echo "端口已释放"
 
 - `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `src/config/config.cpp`）。
   可用 `--config <path>` 显式指定；默认依次查找当前目录及上级目录的 `config.json`。
-- `html/script.js`：页面启动时 `fetch('config.json')` 读取。**注意**：内置 C++ HTTP 服务
-  （8443）只返回白名单字段，而旧 nginx 入口（8444）仍会把整份 `config.json` 暴露出去——
-  这是要继续修的问题（方案文档 W-06）。
-- `signalling-server/server.js`：启动时读取 `config.json`。
+- `html/script.js`：页面启动时 `fetch('config.json')` 读取。内置 HTTP 服务只返回
+  **白名单字段**（当前为 `concurrency.max_users`），不会把路径/证书等内部信息暴露给访客。
 - `Godot/test/main.gd`：启动时读取 `config.json`。
 
 因此修改 `config.json` 后只需重启对应进程（浏览器需刷新页面），**无需重新编译**。
 
 ### `http` 段与敏感字段的环境变量注入
 
-新增的 `http` 段控制内置 HTTP 服务（P2 替代 nginx）：
+`http` 段控制内置 HTTP(S) 服务：
 
 ```json
 "http": {
@@ -318,18 +243,15 @@ CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
 未设置环境变量时行为不变；若证书或私钥缺失，HTTP 服务会**拒绝启动并给出明确原因**
 （而不是静默降级为明文 HTTP），视频链路不受影响。
 
-> 注意：`config.json` 中的 `nginx.server_name` 与 `html/nginx.conf` 中的 `server_name`
-> 已统一改为 `127.0.0.1`（原域名为 `ar.myc.wiki`，已过期）。浏览器即通过该 IP 访问。
-
 ## 敏感证书（fail-closed）
 
-`signalling-server/certs/` 中只提交公开证书 `dev-cert.pem`。所有私钥
+`certs/` 中只提交公开证书 `dev-cert.pem`。所有私钥
 （`*.key`、`*.pfx`、`*.new`、`backup/`、`dev-key.pem`）均被 gitignore，**绝不可进入仓库历史**。
 
 当前 `dev-cert.pem` / `dev-key.pem` 为**自签证书**（`CN=127.0.0.1`，SAN=`IP:127.0.0.1, DNS:localhost`，
 `basicConstraints=CA:TRUE`）。因为域名已过期，无法再用 Let's Encrypt 签证书。
 
-浏览器访问 `https://127.0.0.1:8444/` 时，自签证书会弹“连接不安全”提示。两种处理方式：
+浏览器访问 `https://127.0.0.1:8443/` 时，自签证书会弹“连接不安全”提示。两种处理方式：
 
 - **导入信任**：把 `dev-cert.pem` 导入浏览器/系统证书库并标记为受信任（`CA:TRUE` 使其可作为信任锚点）；
 - **手动接受**：在浏览器安全告警页点击“继续前往”。
@@ -338,8 +260,8 @@ CLOUDVR_TLS_KEY=/etc/cloudvr/tls.key ./build/webrtc_sender
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
-  -keyout signalling-server/certs/dev-key.pem \
-  -out    signalling-server/certs/dev-cert.pem \
+  -keyout certs/dev-key.pem \
+  -out    certs/dev-cert.pem \
   -days 825 -subj "/CN=127.0.0.1" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
   -addext "basicConstraints=critical,CA:TRUE" \

@@ -1,7 +1,7 @@
 # 多用户 + 多 GPU 架构设计文档
 
 > 状态：**已部分实施。单卡多用户（P1~P3）与 C++ 编排 Godot 子进程（P4 前置）已完成；多 GPU 编码绑定、多卡编排（P4 完整）、WSL2 双卡测试（P5）、原生 Linux 多卡验证（P6）尚未实施。** 各阶段实现状态见 §7。
-> 适用范围：`src/` 发送端、`Godot/test/` 游戏端、`signalling-server/` 信令、`html/` 浏览器前端。
+> 适用范围：`src/` 发送端、`Godot/test/` 游戏端、内置信令（`src/signalling/`）、`html/` 浏览器前端。
 > 目标：把当前"1 发送端 ↔ 1 浏览器"的单用户点对点系统，改造为"多个用户、每个用户一个 Godot 玩家实例、多 GPU 上并行渲染+编码"的系统。
 > 结论先行：**改造核心是把整条全链路单例（SubViewport/shm/sender/pipeline/ws_conn/输入）用一个用户索引 `u` 参数化；Godot 因单进程只能用一张卡而采用"每 GPU 一个 Godot 实例"，由 C++ sender 统一启动与编排；并发上限由唯一配置源 `config.json` 的 `topology` 强校验决定。**
 
@@ -132,7 +132,7 @@ signalling server（Map<id,conn>，校验 total_users 上限 + 自动分配 view
 
   "gstreamer": {
     "signalling_url": "wss://127.0.0.1:8443",
-    "signalling_ca_path": "/home/myc/develop/test/signalling-server/certs/dev-cert.pem",
+    "signalling_ca_path": "/home/myc/develop/test/certs/dev-cert.pem",
     "id_template": { "sender": "sender_{index}", "viewer": "viewer_{index}" }
   },
 

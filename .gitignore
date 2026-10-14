@@ -32,8 +32,8 @@ Godot/test/.godot/
 html/logs/
 
 # ---- TLS 材料：仅保留公开证书 dev-cert.pem，其余一律忽略（fail-closed）----
-signalling-server/certs/*
-!signalling-server/certs/dev-cert.pem
+certs/*
+!certs/dev-cert.pem
 
 # ---- 通用临时/备份文件 ----
 *.bak
