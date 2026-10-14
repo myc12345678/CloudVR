@@ -1,6 +1,0 @@
-# 各平台预编译二进制统一按 Git LFS 存储，避免撑大 git 仓库与历史。
-# 使用前需要：git lfs install
-Godot/test/addons/webrtc/lib/*.so filter=lfs diff=lfs merge=lfs -text
-Godot/test/addons/webrtc/lib/*.dll filter=lfs diff=lfs merge=lfs -text
-Godot/test/addons/webrtc/lib/*.dylib filter=lfs diff=lfs merge=lfs -text
-Godot/test/addons/webrtc/lib/*.framework/** filter=lfs diff=lfs merge=lfs -text

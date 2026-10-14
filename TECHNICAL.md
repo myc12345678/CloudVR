@@ -747,7 +747,6 @@ GStreamer 提供完整的媒体 Pipeline 抽象：
         ├── Player.gd                    # 角色控制器（读自己的 PlayerInput）
         ├── player.tscn                  # 玩家场景（运行时实例化 N 份）
         ├── node_3d.tscn                 # 主场景（世界内容）
-        └── addons/webrtc/               # WebRTC GDExtension
 ```
 
 ---

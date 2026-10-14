@@ -34,10 +34,7 @@ cp config.json.example config.json          # config.json 已 gitignore，不入
 # 配置在运行时读取：GStreamer sender / 浏览器 / Godot / node 均直接读取 config.json，
 # 无需再运行 gen_config.py 生成配置头/脚本。
 
-# 2) 拉取 WebRTC GDExtension 预编译库（仅克隆到新机器时需要）
-git lfs install
-
-# 3) 构建 GStreamer 发送端（CMake）
+# 2) 构建 GStreamer 发送端（CMake）
 cmake -B build                              # 配置（默认 Release）
 cmake --build build -j                      # 产物为 build/webrtc_sender（已 gitignore）
 
@@ -277,18 +274,6 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
   -addext "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"
 ```
-
-## WebRTC 预编译库（Git LFS 管理）
-
-`Godot/test/addons/webrtc/lib/` 是第三方 Godot WebRTC native GDExtension
-的各平台预编译二进制（约 98MB，非本仓库源码），改由 **Git LFS** 存储，仓库内只保留 LFS 指针。
-
-首次在仓库内使用需安装 LFS 过滤器：
-```bash
-git lfs install
-```
-克隆时文件会由 LFS 自动拉取（需机器上已安装 git-lfs）。若某台机器没有 git-lfs，
-clone 后只会得到指针而不是真实二进制。
 
 ## 构建（GStreamer 端）
 

@@ -59,7 +59,7 @@
 | 9 | PRIME 环境变量注入（独显强制） | `godot_process.cpp:36-44` | ⚠️ 变差（进程级全局，见 §3.5） |
 | 10 | Godot 需要**真实窗口**（`get_window().set_size`、`DisplayServer.window_set_vsync_mode`） | `Godot/test/main.gd:47-52` | ⚠️ 仍需 DisplayServer，非 headless |
 | 11 | `config.json` 的 `godot.*` 配置段 | `src/config/config.h:36-39`；`config.json:14-22` | 部分字段语义变化 |
-| 12 | `addons/webrtc` GDExtension（`extension_list.cfg` 自动加载，但 GDScript 未实际使用） | `Godot/test/.godot/extension_list.cfg` | 兼容；**建议移除**以降低风险 |
+| 12 | `addons/webrtc` GDExtension（`extension_list.cfg` 自动加载，但 GDScript 未实际使用） | `Godot/test/.godot/extension_list.cfg` | 兼容；**建议移除**以降低风险 → **已执行**：`addons/webrtc` 与 `.gitattributes`(LFS) 已删除 |
 
 > 关键观察：**项目现有帧通路完全不依赖 GDExtension**（纯 GDScript + `FileAccess`），GDExtension 能力尚未被使用。这既是 libgodot 改造可以"只换壳"的有利条件，也说明现在没有现成的宿主扩展可复用。
 
