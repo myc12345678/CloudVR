@@ -131,11 +131,17 @@ static std::string build_pipeline_desc(int u) {
 
   if (g_config.enc_is_hardware) {
     // NVENC 硬件编码路径
-    // cudaupload → 零拷贝上传 CPU 帧到 GPU 显存
-    // cudaconvert → GPU 端格式转换（RGB → NV12），nvh264enc 强制要求 NV12
-    // 注意：cudaconvert 必须在 cudaupload 之后、编码器之前，否则编码器收不到
-    // NV12 输入
-    desc << "cudaupload ! cudaconvert ! " << g_config.enc_pipeline_elem << " "
+    // cudaupload → 上传 CPU 帧到 GPU 显存（零拷贝交接给编码器）
+    //
+    // 注意：这里刻意不再使用 cudaconvert，原因有三：
+    //   1. nvcodec 编码器（nvh264enc / nvautogpuh264enc）的 sink caps 直接接受
+    //      { NV12, Y444, VUYA, RGBA, RGBx, BGRA, BGRx }，并不"强制要求 NV12"；
+    //   2. 协商时上游 videoconvert 已按编码器首选格式输出 NV12，故 cudaconvert
+    //      在此只会做 NV12 → NV12 的空转；
+    //   3. 该元素在 Arch 打包的 GStreamer 中并未被注册（cudaconvert /
+    //      cudaconvertscale 均不可用，1.28.7 与 1.28.8 实测一致），保留会使
+    //      gst_parse_launch 直接失败：no element "cudaconvert"。
+    desc << "cudaupload ! " << g_config.enc_pipeline_elem << " "
          << g_config.enc_options << " ! h264parse ! "
          << g_config.enc_rtp_payloader << " ! " << g_config.enc_rtp_caps
          << " ! ";
