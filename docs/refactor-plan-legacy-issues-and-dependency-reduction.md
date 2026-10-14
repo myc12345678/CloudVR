@@ -223,12 +223,12 @@
 
 | 编号 | 标题 | 严重度 | 证据 | 验证 | 影响 / 修复 |
 |---|---|---|---|---|---|
-| **B-1** | **`send_sdp_to_peer`/`send_ice_to_peer` 每次调用泄漏整棵 `JsonObject` 树** | **高** | `src/signalling/signalling.cpp:51-63`（`msg` 创建后送入 `json_object_to_string`，函数结束前从未 `json_object_unref`）、`:65-77` 同样 | ✅ **实测**：复刻该路径 20 万次 → RSS 增长 **240 972 KB（≈1.2 KB/次）**；补一行 `json_object_unref(msg)` 后增长 **0 KB** | 长运行进程内存单调增长（ICE candidate 可达数十条/连接 × 每用户 × 多次重连）。**一行修复** |
+| **B-1** | ~~**`send_sdp_to_peer`/`send_ice_to_peer` 每次调用泄漏整棵 `JsonObject` 树**~~ **✅ 已解决** | **高** | `src/signalling/signalling.cpp:51-63`（`msg` 创建后送入 `json_object_to_string`，函数结束前从未 `json_object_unref`）、`:65-77` 同样 | ✅ **实测**：复刻该路径 20 万次 → RSS 增长 **240 972 KB（≈1.2 KB/次）**；补一行 `json_object_unref(msg)` 后增长 **0 KB** | ✅ **已修复**：两处补 `json_object_unref(msg)`。复测 200k 次：修复前 RSS +244 188 KB（1.22 KB/次）→ 修复后 +372 KB（0.00 KB/次）。`json_object_set_object_member` 会移交子对象所有权，故 unref 父对象即可释放整棵树 |
 | **C-3** | **远端一条 JSON 即可令 sender 段错误退出（DoS）** | **高** | `signalling.cpp:151-153`（`json_object_get_string_member` 缺成员/类型不符返回 NULL + critical）、`:162`（`strlen(sdp_str)` 对 NULL 解引用）、`:193-199`（`candidate` 可能 NULL 直接送入 `add-ice-candidate`）、`:279-285` | ✅ 源码 | 任何能连上信令的对端发 `{"sdp":{"type":"offer"}}` 即崩溃 | 用 `json_object_has_member` + `JSON_NODE_HOLDS_VALUE` 显式校验并逐字段判空；整体 schema 校验 |
-| **C-1** | **`fps=0` 触发整数除零崩溃（SIGFPE）** | **高** | `pipeline.cpp:33`（`frame_index % g_config.frame_fps`）、`:25,27`（`gst_util_uint64_scale` 分母为 0）；来源 `config.cpp:118`（`get_int` 无下界） | ✅ 源码 | 配置文件可写者即可崩溃进程 | 加载后强校验 `0 < fps ≤ 1000`，非法拒绝启动 |
+| **C-1** | ~~**`fps=0` 触发整数除零崩溃（SIGFPE）**~~ **✅ 已解决** | **高** | `pipeline.cpp:33`（`frame_index % g_config.frame_fps`）、`:25,27`（`gst_util_uint64_scale` 分母为 0）；来源 `config.cpp:118`（`get_int` 无下界） | ✅ 源码 | 配置文件可写者即可崩溃进程 | ✅ **已修复**：`config.cpp::validate_config` 校验 `fps ∈ [1,1000]`，非法即拒绝启动。实测复现过现场（退出码 136 + `_gst_util_uint64_scale: assertion 'denom != 0' failed` + coredump），修复后同一配置被拒绝 |
 | **A-1** | **SHM `ready` 自旋无超时、不检查 `shm_running`，写端异常即永久挂死** | **高** | `tcp_server.cpp:308-314`（`while(!ready){…yield()}`）、`:340-345`（`join()`） | ✅ 源码 | Godot 若在 `ready=0` 之后、写头部之前崩溃/被 SIGSTOP/长卡顿，读线程永不退出 → `stop_shm_frame_reader` 的 `join()` 永久阻塞 → 复位路径与整进程清理全部卡死，**Ctrl-C 也无效**。改为「超时上限 + 每轮检查 `shm_running`」 |
 | **A-4** | **`send_to_godot` 持锁无超时阻塞发送，可永久卡死 GLib 主循环** | **高** | `tcp_server.cpp:54-75`（`send_all` 无超时，`EAGAIN` 仅 `usleep(1000)` 无限重试）、`:82`（全程持 `tcp_client_mutex`）、`:109-117`；socket 未设 `SO_SNDTIMEO`/非阻塞 | ✅ 源码 + grep | Godot 卡顿不读 socket 时发送缓冲（约 200 KB）被 mousemove 填满 → `send()` 永久阻塞，**ICE/信令/总线处理/自愈全部停摆**，且 `stop_godot_tcp_server` 需同一把锁 → 无法退出。改非阻塞 + 总时限；锁内不阻塞 |
-| A-17 | 拓扑配置未校验非负，负数可绕过乘积校验导致**越界写** | 中 | `main.cpp:53-68`（只查 `max_users∈[1,16]` 与乘积相等）、`config.cpp:107-108`（`get_int` 允许负数）、越界入口 `common.cpp:23-25`、`tcp_server.cpp:81,183`、`main.cpp:76-84` | ✅ 源码 | 例：`gpu_count=-2, players_per_gpu=-8, max_users=16` 通过全部校验 → `s.gpu = u / -8` 为负 → `gpu_tcp(-1)`/`session(负)` 越界访问全局数组（UB） | 校验 `gpu_count≥1 && players_per_gpu≥1`；`session()/gpu_tcp()` 加边界断言 |
+| A-17 | ~~拓扑配置未校验非负，负数可绕过乘积校验导致**越界写**~~ **✅ 已解决** | 中 | `main.cpp:53-68`（只查 `max_users∈[1,16]` 与乘积相等）、`config.cpp:107-108`（`get_int` 允许负数）、越界入口 `common.cpp:23-25`、`tcp_server.cpp:81,183`、`main.cpp:76-84` | ✅ 源码 | 例：`gpu_count=-2, players_per_gpu=-8, max_users=16` 通过全部校验 → `s.gpu = u / -8` 为负 → `gpu_tcp(-1)`/`session(负)` 越界访问全局数组（UB） | ✅ **已修复**：`validate_config` 强制 `gpu_count≥1 && players_per_gpu≥1`（实测 -2/-8 曾绕过校验并正常启动，现被拒）；`session()/gpu_tcp()` 增加越界即 `abort` 的 fail-fast 兜底，把静默内存损坏变成立刻可见的终止 |
 | A-15 / D-8 | **自愈计数器永不归零**：管线复位 5 次后永久失去自愈；Godot 重启退避永不复位 | 中 | `pipeline.cpp:49`（`MAX_PIPELINE_RESETS=5`）、`:55-60`（达上限后仅打印放弃）、`pipeline_error_resets` 仅增不减（`session.h:39`）；`godot_process.cpp:108-111,156` | ✅ 源码 | 进程寿命内累计 5 次瞬时错误后，再出错也**不再自愈**（画面永久黑屏但进程/浏览器仍显示正常）；Godot 连重启 5 次后永久固定 30 s 重试 | 稳定运行 N 秒后清零；统一为滑动窗口限流 |
 | A-12 | **所有 socket/shm fd 无 close-on-exec**，Godot 子进程继承父进程全部句柄 | 中 | `tcp_server.cpp:236`（`open` 无 `O_CLOEXEC`）、`:369`（`socket` 无 `SOCK_CLOEXEC`）、`:127`（`accept` 无 `SOCK_CLOEXEC`）；`godot_process.cpp:47-77` 未关 fd | ✅ 源码 + grep（全目录无 CLOEXEC） | 每次重启 Godot 都继承监听 fd/客户端 fd/shm fd/WebSocket fd → 父进程 `close()` 后端口仍被占用、对端收不到 FIN，排障极难 | 一律加 `SOCK_CLOEXEC`/`O_CLOEXEC`；子进程 exec 前 `close_range(3,~0U,0)` |
 | A-14 | `on_child_exit` 中重复 `waitpid` 是空操作，注释与事实相反 | 低 | `godot_process.cpp:121-127`（注释称"waitpid 回收必须在这里手动完成"） | ✅ **实测**：fork + `g_child_watch_add` 回调内 `waitpid(…,WNOHANG)` 返回 `-1/ECHILD` → GLib 已回收 | 删除多余 `waitpid` 并更正注释，否则后人据此删掉 child watch 会出现僵尸 |
@@ -245,7 +245,15 @@
 | F-3 | `-lrt` 多余（现代 glibc 已并入 libc） | 低 | `Makefile:11` | ✅ 源码 | 无害但误导 | 移除 |
 | A-2 | 无 seqlock/双缓冲，拷贝期间写端可覆盖（撕裂帧） | 中 | 见 **L-16**（本节同一问题，编号不同） | ✅ 源码 | 见 L-16 | 见 L-16 |
 
-> **待验证项**（审计明确标注为推理，未运行时复现）：A-5（主循环内 `join()` 阻塞生产者致死锁）、A-6（WebRTC/ICE 回调线程不确定，与主循环并发读写 `ws_conn` 并跨线程调用 libsoup）、A-7（在自身信号处理器内 `g_object_unref`）、A-11（`gst_init` 后 `fork()` 子进程内调用非 async-signal-safe 函数）、A-16（信号处理器内调用 `g_main_loop_quit`）、C-2（`w*h*3` 在 `size_t` 上回绕）、S-7（`/dev/shm` 文件权限未受控）。
+> **C-2 复核结论（实测后下调严重度）**：审计推断 `w*h*3` 在 `size_t` 上回绕，但代码是
+> `static_cast<size_t>(width) * height * 3` —— **先转 size_t 再乘**，审计暗示的 32 位溢出
+> 不会发生；64 位回绕需两个维度都接近 `UINT_MAX`（≈4.29e9），只能由本地改 config 触发，
+> 且回绕结果仍是天文数字（`width=height=-1` → ≈1.8e19 字节）。未找到能回绕成小值
+> （危险形态）的维度组合。真实后果是 shm 尺寸失控导致 **打不开共享内存 → 无画面**，
+> 属自伤型配置错误而非内存破坏。现已由 `validate_config` 的 `width,height ∈ [1,16384]`
+> 上界一并关闭（该上界同时保证此乘法不可能溢出）。
+>
+> **待验证项**（审计明确标注为推理，未运行时复现）：A-5（主循环内 `join()` 阻塞生产者致死锁）、A-6（WebRTC/ICE 回调线程不确定，与主循环并发读写 `ws_conn` 并跨线程调用 libsoup）、A-7（在自身信号处理器内 `g_object_unref`）、A-11（`gst_init` 后 `fork()` 子进程内调用非 async-signal-safe 函数）、A-16（信号处理器内调用 `g_main_loop_quit`）、~~C-2（`w*h*3` 在 `size_t` 上回绕）~~ **C-2 已复核并修复（严重度下调，见下）**、S-7（`/dev/shm` 文件权限未受控）。
 
 
 

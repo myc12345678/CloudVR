@@ -88,6 +88,10 @@ static void send_sdp_to_peer(int u, const gchar *type,
   gchar *text = json_object_to_string(msg);
   send_text(u, text);
 
+  // B-1：json_object_set_object_member 会把子对象的所有权交给父对象，
+  // 因此 unref(msg) 即可释放整棵树。原实现漏了这一行，实测每调用泄漏
+  // 约 1.2 KB（200k 次 → RSS +244 MB），长运行内存单调增长。
+  json_object_unref(msg);
   g_free(text);
   g_free(sdp_string);
 }
@@ -103,6 +107,7 @@ static void send_ice_to_peer(int u, guint mlineindex, const gchar *candidate) {
   gchar *text = json_object_to_string(msg);
   send_text(u, text);
 
+  json_object_unref(msg); // B-1：同上，否则每发一个 ICE 候选泄漏约 1.2 KB
   g_free(text);
 }
 

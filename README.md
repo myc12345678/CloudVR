@@ -197,6 +197,16 @@ ss -ltnp | grep -E ':8443|:9002' || echo "端口已释放"
 `config.json` 含本机绝对路径与主机名，**已 gitignore**。克隆/换机器后按上文「一次性的初始化」第 1 步
 复制 `config.json.example` 为 `config.json` 即可。
 
+**加载时会做强校验，非法值直接拒绝启动**（而不是带着坏值跑到崩溃或静默越界）：
+
+| 配置项 | 允许范围 | 越界后果（修复前） |
+|---|---|---|
+| `video.fps` | `[1, 1000]` | `0` 会让 `gst_util_uint64_scale` 除零 → **SIGFPE 崩溃** |
+| `video.width` / `height` | `[1, 16384]` | 负数/极端值经无符号转换后尺寸失控 → 共享内存打不开 |
+| `topology.gpu_count` / `players_per_gpu` | `≥ 1` | 负数乘积可绕过 `max_users` 校验 → 用户 GPU 索引为负 → **越界读写** |
+
+失败时日志形如 `FATAL: 配置项 video.fps 非法（必须在 [1, 1000]），拒绝启动`。
+
 所有子系统均在**运行时**读取该文件，无需重新编译：
 
 - `build/webrtc_sender`：启动时用 json-glib 解析 `config.json`（见 `src/config/config.cpp`）。

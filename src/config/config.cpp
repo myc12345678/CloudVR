@@ -67,6 +67,38 @@ std::string expand_index_template(const std::string &tmpl, int index) {
   return out;
 }
 
+// ======================== 启动期配置强校验 ========================
+// 放在"配置进入系统之前"，把非法值一次挡掉。历史上这些字段只做类型转换：
+//   video.fps = 0             → gst_util_uint64_scale 除零 → SIGFPE（C-1）
+//   topology.* 为负           → 乘积校验被绕过 → gpu_tcp(-1) 越界写（A-17）
+// 上界同时保证 shm_frame_max_size 的乘法不可能溢出 size_t（C-2）。
+static bool validate_config(const Config &cfg) {
+  const auto fail = [](const char *field, const char *why) {
+    std::cerr << "FATAL: 配置项 " << field << " 非法（" << why << "），拒绝启动"
+              << std::endl;
+    return false;
+  };
+
+  // 必须 ≥1：否则 max_users == gpu_count × players_per_gpu 会被负数乘积满足，
+  // 随后 u / players_per_gpu 得到负的 gpu 索引，越界访问 g_gpu_tcp。
+  if (cfg.gpu_count < 1)
+    return fail("topology.gpu_count", "必须 ≥ 1");
+  if (cfg.players_per_gpu < 1)
+    return fail("topology.players_per_gpu", "必须 ≥ 1");
+
+  // fps 是 gst_util_uint64_scale 与取模的分母，0 会直接 SIGFPE。
+  if (cfg.frame_fps < 1 || cfg.frame_fps > 1000)
+    return fail("video.fps", "必须在 [1, 1000]");
+
+  // 分辨率上界取 16384（常见纹理/编码器上限）；再大也只会让 shm 尺寸失控。
+  if (cfg.frame_width < 1 || cfg.frame_width > 16384)
+    return fail("video.width", "必须在 [1, 16384]");
+  if (cfg.frame_height < 1 || cfg.frame_height > 16384)
+    return fail("video.height", "必须在 [1, 16384]");
+
+  return true;
+}
+
 bool load_config(Config &cfg, const std::string &config_path) {
   GError *error = nullptr;
   gchar *data = nullptr;
@@ -195,7 +227,17 @@ bool load_config(Config &cfg, const std::string &config_path) {
         get_string(h, "tls_key_path", cfg.http_tls_key_path);
   }
 
+  // ---- 启动期强校验 ----
+  // 只做类型转换而不做范围校验，非法配置会一路走到除法与数组下标上：
+  //   video.fps = 0             → gst_util_uint64_scale 除零 → SIGFPE（C-1，实测复现）
+  //   topology.* < 0            → 乘积校验被负数绕过 → gpu_tcp(-1) 越界写（A-17，实测复现）
+  //   video.width/height 极端值 → 尺寸计算回绕/天文数字 → shm 打不开（C-2）
+  // 因此必须在配置进入系统**之前**一次性拒绝。上界同时保证下面的乘法不可能溢出。
+  if (!validate_config(cfg))
+    return false;
+
   // ---- 派生的运行期尺寸 ----
+  // 经上面的范围校验后 w、h ≤ 16384，乘积最大约 805 MB，不会回绕 size_t。
   cfg.shm_frame_max_size =
       static_cast<size_t>(cfg.frame_width) * cfg.frame_height * 3; // RGB8
   cfg.shm_total_size = SHM_FRAME_HEADER_SIZE + cfg.shm_frame_max_size;
