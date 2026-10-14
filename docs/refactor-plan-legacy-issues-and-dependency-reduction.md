@@ -145,23 +145,23 @@
 |---|---|---|---|---|
 | L-20 | 无任何自动化测试 | 全仓库无 test 目录/CI 配置 | 每次改动靠手工端到端验证 | 先给 `config.cpp`（解析）、协议编解码、环形缓冲加单测 |
 | **L-21** | **关停顺序与 Godot 自动重启冲突**（比"pkill 脆弱"更严重） | `README.md:213` 先 pkill Godot → `:216` 才杀 sender；而 `README.md:75` + `config.json:20`（`launch=true`）表明 sender 会在崩溃/退出前**自动拉起 Godot** | 关停脚本杀掉 Godot 后被 sender 立刻重启，反复 kill 或残留进程 | **先停 sender（让其停止监督）再停 Godot**；提供 `stop.sh` 并写清顺序 |
-| L-24 | pkill 模式脆弱/过宽，无 PID 文件 | `README.md:213/216/219/229`（`[g]odot --path`、`[w]ebrtc_sender`、`[n]ode server\.js`）；Node/sender 无 pidfile | 误杀同名进程；改名即失效；多实例无法区分 | PID 文件或 systemd 单元 |
+| L-24 | ~~pkill 模式脆弱/过宽，无 PID 文件~~ **✅ 已解决** | `README.md:213/216/219/229`（`[g]odot --path`、`[w]ebrtc_sender`、`[n]ode server\.js`）；Node/sender 无 pidfile | 误杀同名进程；改名即失效；多实例无法区分 | PID 文件或 systemd 单元 |
 | L-25 | 前端调试残留与死代码 | `html/script.js:749-756`（`_dbgCount`）、`:251/378/387/455`（全量 SDP/ICE 入页面与控制台）、`:59/149-152/721-724`（悬空/空写/未使用变量） | 演示观感差、SDP 内网信息外泄、误导维护 | 加 debug 开关默认关闭；删除死代码 |
 | L-26 | 前端输入采集过宽：document 级监听、坐标不 clamp、失焦不复位、无启用开关 | `html/script.js:659-683`（全局 mousemove/keydown/keyup，无 blur 处理）、`:627-707` 无开关 UI | 鼠标经过侧栏也注入远端；失焦后远端按键卡死；用户不知情地交出键鼠 | 仅视频聚焦且指针在视频内时发送；clamp 0..1；blur 补发 keyup；显式开关 |
-| L-27 | `config.json` 的 `nginx` 配置段无任何消费者 | `config.json:39-45`；全仓无读取者（`nginx.conf` 已硬编码端口/证书） | 改配置不生效 → 端口/证书静默漂移 | 删除该段或由脚本渲染 `nginx.conf` |
+| L-27 | ~~`config.json` 的 `nginx` 配置段无任何消费者~~ **✅ 已解决（该段已删除）** | `config.json:39-45`；全仓无读取者（`nginx.conf` 已硬编码端口/证书） | 改配置不生效 → 端口/证书静默漂移 | 删除该段或由脚本渲染 `nginx.conf` |
 | L-22 | 无健康检查/指标/日志分级 | 全程 `std::cout/cerr`；Node 日志无级别/无时间戳且打印完整 SDP/ICE（`server.js:293-295`） | 线上无法定位问题、日志泄露内网信息 | 引入日志级别 + 简单指标端点 + 日志轮转 |
-| L-23 | 配置错误容忍度不一致 | 文档自述 `fail-open`（`config.h:71-72`）与 `main.cpp:53-68` 的 fail-closed 强校验并存 | 行为难预期 | 明确统一策略并写进文档 |
+| L-23 | ~~配置错误容忍度不一致~~ **✅ 已解决** | 文档自述 `fail-open`（`config.h:71-72`）与 `main.cpp:53-68` 的 fail-closed 强校验并存 | 行为难预期 | 明确统一策略并写进文档 |
 
 ### 1.4 安全（P1）
 
 | 编号 | 标题 | 证据 | 影响 | 修复建议 |
 |---|---|---|---|---|
 | L-30 | ~~**信令 WebSocket 客户端接受任意证书**~~ **✅ 已解决** | `src/signalling/signalling.cpp:347-352`：`on_accept_certificate` 打印 "Accepting … despite validation" 并接受；`:443-455` 虽加载 CA 库但被覆盖 | 中间人可劫持信令 → 可注入 SDP/ICE | ✅ **随信令客户端整体移除而消除**：信令改为进程内本地对端（`signalling_server_register_local`），不再有客户端 TLS，`signalling_ca_path`/`signalling_url` 配置项一并删除（commit 见 git 历史） |
-| L-31 | **信令无认证/授权，可劫持他人会话槽位** | `signalling-server/server.js:242-260`：`HELLO <id>` 只校验索引 `< MAX_USERS`，随后 **无条件 `clients.set(id, state)` 覆盖已有槽位**；`:264-268` 的 `SESSION <peer_id>` 亦无任何约束 | ✅ 实测（读码） | 任意客户端发 `HELLO viewer_0` 即可顶掉该观众，再 `SESSION sender_0` 接收他人视频流 / 注入 SDP·ICE | 引入一次性 ASSIGN 票据或共享令牌；`HELLO` 拒绝已占用的 id（改用 `ASSIGN` 为唯一入口）；`SESSION` 校验对端白名单 |
-| L-32 | 输入通道无鉴权 | `src/transport/tcp_server.cpp` 无 token 校验 | 本机端口暴露即可注入输入 | 绑定回环 + 随机端口/令牌 |
-| **L-34** | **WebSocket 帧长无上限 + 无界缓冲 + O(n²) 拼接** | `signalling-server/server.js:59-60`（每 chunk `Buffer.concat`）、`:72-87`（只查高 32 位，`payloadLen` 可达 2^32-1） | 单连接声明超大帧即可耗尽内存/CPU 并阻塞事件循环（**最容易触发的 DoS**） | 设 `MAX_FRAME`/`MAX_BUFFER`（如 64 KB），超限 `close(1009)` |
-| L-35 | 半开连接永久占槽（无服务端心跳） | `server.js:352-368` 只监听 data/end/error，无 ping/timeout；`README.md:145` 却称"关闭后槽位自动释放" | WiFi 掉线/挂起后槽位泄漏，最终"全满"且与文档不符 | 服务端 ping/pong 空闲超时（如 60 s）+ `setTimeout` + `close` 兜底 |
-| L-36 | ASSIGN 不校验对端 sender 是否在线 | `server.js:221-233` | 分配到无对端的槽位 → 黑屏且槽位虚占 | 分配需 `sender_k` 在线，或由 sender 预注册"就绪"槽位 |
+| L-31 | ~~**信令无认证/授权，可劫持他人会话槽位**~~ **✅ 已解决（N-01/N-02，并随 Node 实现移除）** | `signalling-server/server.js:242-260`：`HELLO <id>` 只校验索引 `< MAX_USERS`，随后 **无条件 `clients.set(id, state)` 覆盖已有槽位**；`:264-268` 的 `SESSION <peer_id>` 亦无任何约束 | ✅ 实测（读码） | 任意客户端发 `HELLO viewer_0` 即可顶掉该观众，再 `SESSION sender_0` 接收他人视频流 / 注入 SDP·ICE | 引入一次性 ASSIGN 票据或共享令牌；`HELLO` 拒绝已占用的 id（改用 `ASSIGN` 为唯一入口）；`SESSION` 校验对端白名单 |
+| L-32 | ~~输入通道无鉴权~~ **✅ 已缓解（绑回环，C-6/S-3）** | `src/transport/tcp_server.cpp` 无 token 校验 | 本机端口暴露即可注入输入 | 绑定回环 + 随机端口/令牌 |
+| **L-34** | ~~**WebSocket 帧长无上限 + 无界缓冲 + O(n²) 拼接**~~ **✅ 已解决（N-03：256KiB 上限 + TOO_BIG 关闭；分帧改由 libsoup 负责）** | `signalling-server/server.js:59-60`（每 chunk `Buffer.concat`）、`:72-87`（只查高 32 位，`payloadLen` 可达 2^32-1） | 单连接声明超大帧即可耗尽内存/CPU 并阻塞事件循环（**最容易触发的 DoS**） | 设 `MAX_FRAME`/`MAX_BUFFER`（如 64 KB），超限 `close(1009)` |
+| L-35 | ~~半开连接永久占槽（无服务端心跳）~~ **✅ 已解决（N-05：WS keepalive 30s + 关闭即释放槽位）** | `server.js:352-368` 只监听 data/end/error，无 ping/timeout；`README.md:145` 却称"关闭后槽位自动释放" | WiFi 掉线/挂起后槽位泄漏，最终"全满"且与文档不符 | 服务端 ping/pong 空闲超时（如 60 s）+ `setTimeout` + `close` 兜底 |
+| L-36 | ~~ASSIGN 不校验对端 sender 是否在线~~ **✅ 已解决** | `server.js:221-233` | 分配到无对端的槽位 → 黑屏且槽位虚占 | 分配需 `sender_k` 在线，或由 sender 预注册"就绪"槽位 |
 | L-37 | 自签证书是 **CA:TRUE**，SAN 与实际访问地址不符；私钥 `-nodes` 明文 | 实测 `openssl x509`：`basicConstraints=critical,CA:TRUE`、`keyUsage=keyCertSign`、SAN 仅 `IP:127.0.0.1,DNS:localhost`；`README.md:265-284` | 私钥泄露即可签发任意证书；换 IP/域名访问必然证书错误，并训练用户"点继续" | 改签**叶子证书（CA:FALSE）**，SAN 覆盖实际地址；私钥加口令 |
 | L-38 | 明文 `ws://` 回退无告警；无 Origin 校验（CSWSH）；无安全响应头 | `html/script.js:31-33` 按协议选择 ws/wss；`server.js:391-397` 只检查 upgrade 头；`html/nginx.conf` 全文无 `add_header` | 局域网任意主机/任意网页可抢槽位、注入输入 | 仅允许 wss + 校验 Origin 白名单 + 加 HSTS/CSP/X-Frame-Options |
 | L-33 | 私钥保护仅依赖 `.gitignore` | `.gitignore` 中 `certs/*` + `!certs/dev-cert.pem` | 误提交风险 | 加 pre-commit 检查；生产改用非仓库路径 |

@@ -111,6 +111,15 @@ int main(int argc, char *argv[]) {
     gpu_tcp(g).tcp_port = g_config.tcp_port_base + g;
   }
 
+  // ---- 先把各用户注册为信令服务的本地对端（sender_<u>）----
+  // L-36：必须在 HTTP 服务开始监听**之前**完成。原先注册发生在启动管线之后，
+  // 于是「服务器已监听、但 sender_<k> 尚未注册」的窗口内接入的浏览器会拿到一个
+  // 没有对端的槽位，随后 {"reset":true} 无人可转 → 黑屏。
+  // 注册本身只是往信令服务的表里放回调，不依赖 SoupServer，因此可以提前。
+  for (int u = 0; u < g_config.max_users; ++u) {
+    signalling_start(u);
+  }
+
   // ---- 启动内置 HTTP(S) 服务 + 内置信令 ----
   // 失败不阻断视频链路（信令/编码与 Web 服务相互独立），仅打印明确原因。
   if (start_http_server()) {
@@ -132,9 +141,7 @@ int main(int argc, char *argv[]) {
   for (int u = 0; u < g_config.max_users; ++u) {
     start_pipeline(u);
     start_shm_frame_reader(u); // 共享内存视频帧（零拷贝，优选）
-    // 注册为内置信令服务的本地对端（sender_<u>），供浏览器 SESSION 后互发信令。
-    // 信令服务已在上方随 HTTP 服务挂载，因此这里不再有连接失败/重连逻辑。
-    signalling_start(u);
+    // 信令本地对端已在上方（HTTP 服务启动前）统一注册。
   }
   // TCP 输入控制通道按 GPU 启动（每 GPU 一条，供该 GPU 内所有玩家复用）。
   for (int g = 0; g < g_config.gpu_count; ++g) {
