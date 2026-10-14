@@ -51,11 +51,27 @@ static bool read_exact(int fd, void *buffer, size_t size) {
 
 // ======================== 发送数据给 Godot ========================
 
-static ssize_t send_all(int fd, const void *buf, size_t len) {
+// A-4：单条输入消息的发送总时限。超过即断开连接让 Godot 重连，
+// 绝不让 GLib 主循环无限期阻塞（send_to_godot 由 handle_input_message
+// 在主循环上调用）。
+constexpr uint64_t kSendTimeoutMs = 100;
+
+// A-1：等待写端置 ready 的上限。正常仅几十纳秒，200ms 足够覆盖任何合理停顿，
+// 又不至于让 reset / 退出路径明显卡顿。
+constexpr uint64_t kReadyWaitTimeoutMs = 200;
+
+// A-4：保证 send() 永不阻塞主循环。
+// 改用 MSG_DONTWAIT 后 send() 只会立即返回 EAGAIN，不会因为对端不读而挂住；
+// 重试受 deadline 约束，超时即失败返回。**调用方必须在失败时断开连接**：
+// 半条消息（长度头已发出、载荷未发完）会让 Godot 端的长度前缀解帧彻底错位，
+// 比断开重连糟糕得多。
+static ssize_t send_all(int fd, const void *buf, size_t len,
+                        uint64_t deadline_ms) {
   auto *p = static_cast<const uint8_t *>(buf);
   size_t total = 0;
   while (total < len) {
-    ssize_t n = send(fd, p + total, len - total, MSG_NOSIGNAL);
+    const ssize_t n =
+        send(fd, p + total, len - total, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (n > 0) {
       total += static_cast<size_t>(n);
       continue;
@@ -63,7 +79,9 @@ static ssize_t send_all(int fd, const void *buf, size_t len) {
     if (n == 0)
       return -1; // connection closed
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // 缓冲区满，短暂等待后重试
+      // 缓冲区满：短暂等待后重试，但不超过总时限
+      if (now_ms() >= deadline_ms)
+        return -1;
       usleep(1000);
       continue;
     }
@@ -106,14 +124,22 @@ void send_to_godot(int gpu, int player, const void *data, size_t size) {
   header[2] = static_cast<uint8_t>((payload_size >> 8) & 0xFF);
   header[3] = static_cast<uint8_t>(payload_size & 0xFF);
 
-  if (send_all(fd, header, 4) < 0) {
-    std::cerr << "send_to_godot: failed to send header" << std::endl;
-    return;
-  }
+  // A-4：头与载荷共用同一个时限，保证整个调用（含持锁时间）有界。
+  const uint64_t deadline = now_ms() + kSendTimeoutMs;
 
-  if (send_all(fd, payload.data(), payload_size) < 0) {
-    std::cerr << "send_to_godot: failed to send payload" << std::endl;
-    return;
+  if (send_all(fd, header, 4, deadline) < 0 ||
+      send_all(fd, payload.data(), payload_size, deadline) < 0) {
+    // 对端（Godot）卡顿/已断开导致发不完。此时连接上可能残留半条消息，
+    // 继续复用会让 Godot 的解帧错位，因此主动 shutdown 断开：由
+    // tcp_server_loop 走既有清理路径（锁内 close、置 fd=-1），Godot 的 2 秒
+    // 重连逻辑会重新建连，消息流自然重新同步。主循环不会被无限期阻塞。
+    std::cerr << "send_to_godot: 发送超时或失败（Godot 未读取？），断开控制通道"
+              << std::endl;
+    shutdown(fd, SHUT_RDWR);
+    // 立刻标记为无连接：后续输入直接走 "fd < 0" 的早退分支，既不会重复
+    // shutdown，也不会在高频 mousemove 下刷屏。真正的 close 仍由
+    // tcp_server_loop 在锁内完成（它持有自己的局部 client_fd）。
+    t.tcp_client_fd = -1;
   }
 }
 
@@ -219,6 +245,7 @@ static void shm_reader_loop(int u) {
   UserSession &s = session(u);
   uint64_t last_counter = 0;
   uint64_t last_inode_check = 0;
+  uint64_t last_ready_warn_ms = 0; // A-1：ready 等待超时告警的限频时间戳
 
   std::cout << "Shared memory frame reader started" << std::endl;
 
@@ -303,14 +330,40 @@ static void shm_reader_loop(int u) {
     // 中间多帧自动跳过，总是读取最新帧
     last_counter = current;
 
-    // 自旋等待写入完成（通常极短，几十纳秒），加入 yield 避免忙等
+    // 自旋等待写入完成（正常仅几十纳秒），加入 yield 避免忙等。
+    // A-1：必须**有超时上限**且每轮检查 shm_running。写端若在 ready=0 之后
+    // 崩溃 / 被 SIGSTOP / 长卡顿，原先的 `while (!ready)` 没有任何退出路径：
+    // 读线程永久忙等（白烧一个核）→ 永不退出 → stop_shm_frame_reader() 的
+    // join() 挂死 → 复位路径（浏览器发 {"reset":true}）与进程清理全部卡住，
+    // 连 Ctrl-C 都失效，只能 kill -9。
+    const uint64_t ready_deadline = now_ms() + kReadyWaitTimeoutMs;
+    bool ready_ok = false;
     int spin_count = 0;
-    while (!s.shm_frame->ready.load(std::memory_order_acquire)) {
+    while (s.shm_running.load(std::memory_order_acquire)) {
+      if (s.shm_frame->ready.load(std::memory_order_acquire)) {
+        ready_ok = true;
+        break;
+      }
       if (++spin_count > 1000) {
-        // 超过 1000 次自旋仍未完成，让渡 CPU 时间片并重置计数
+        // 超过 1000 次自旋仍未完成，让渡 CPU 时间片并重置计数。
+        // 时限**只在让渡点检查**：正常路径 1~2 次迭代即返回，热路径零额外开销。
         std::this_thread::yield();
         spin_count = 0;
+        if (now_ms() >= ready_deadline)
+          break;
       }
+    }
+
+    if (!ready_ok) {
+      // 写端未完成本帧（崩溃 / 被暂停 / 超长停顿）：丢弃该帧并退避。
+      // last_counter 在等待前已更新为 current，下一轮会等新帧而非反复重试同一帧。
+      const uint64_t now = now_ms();
+      if (now - last_ready_warn_ms >= 1000) { // 限频告警，避免刷屏
+        last_ready_warn_ms = now;
+        std::cerr << "SHM ready 等待超时（写端可能已崩溃或被暂停），丢弃该帧"
+                  << std::endl;
+      }
+      continue;
     }
 
     uint32_t frame_sz = s.shm_frame->frame_size.load(std::memory_order_acquire);
