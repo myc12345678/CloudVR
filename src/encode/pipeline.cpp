@@ -10,8 +10,19 @@
 
 void push_raw_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
   UserSession &s = session(u);
-  GstElement *current_appsrc = s.appsrc;
-  if (!current_appsrc || size == 0)
+  if (size == 0)
+    return;
+
+  // A-5：持引用访问 appsrc。stop_pipeline 会并发地把 s.appsrc 摘下并 unref，
+  // 只用裸指针会 use-after-free；持引用则保证本次 push 期间元素存活（此时它已
+  // 处于 FLUSHING/NULL，push 会返回非 OK，不会阻塞）。
+  GstElement *current_appsrc = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(s.appsrc_mutex);
+    if (s.appsrc != nullptr)
+      current_appsrc = GST_ELEMENT(gst_object_ref(s.appsrc));
+  }
+  if (current_appsrc == nullptr)
     return;
 
   GstBuffer *buffer = gst_buffer_new_allocate(nullptr, size, nullptr);
@@ -34,13 +45,11 @@ void push_raw_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
     std::cout << "Pushed raw frame " << frame_index << ", size=" << size
               << std::endl;
   }
+
+  gst_object_unref(current_appsrc); // 释放本次 push 持有的引用
 }
 
 // 保留旧名称作为别名，兼容 tcp_server.cpp 中的调用
-void push_jpeg_frame_to_appsrc(int u, const uint8_t *data, size_t size) {
-  push_raw_frame_to_appsrc(u, data, size);
-}
-
 // ======================== 管线错误自复位 ========================
 // 为避免编码器 / 管线出现瞬时错误就终止整个 sender，这里在 ERROR/EOS 时
 // 带冷却、带次数上限地重建管线；若持续失败则保持运行并打印降级日志，
@@ -51,6 +60,17 @@ static const unsigned MAX_PIPELINE_RESETS = 5;
 static void maybe_reset_pipeline(int u) {
   UserSession &s = session(u);
   uint64_t now = now_ms();
+
+  // A-15：按"稳定期"归零。原实现只增不减，进程寿命内累计 5 次瞬时错误后自愈能力
+  // 就永久失效——画面黑屏，而进程与浏览器都仍显示正常，极难发现。
+  constexpr uint64_t kStableWindowMs = 60000;
+  if (s.pipeline_error_resets > 0 && s.last_reset_ms != 0 &&
+      now - s.last_reset_ms > kStableWindowMs) {
+    std::cout << "Pipeline 已稳定运行 " << (now - s.last_reset_ms) / 1000
+              << "s，自愈计数归零（原 " << s.pipeline_error_resets << " 次）"
+              << std::endl;
+    s.pipeline_error_resets = 0;
+  }
 
   if (s.pipeline_error_resets >= MAX_PIPELINE_RESETS) {
     std::cerr << "Pipeline error persists; auto-reset disabled ("
@@ -68,10 +88,9 @@ static void maybe_reset_pipeline(int u) {
   s.pipeline_error_resets++;
   std::cerr << "Resetting pipeline (attempt " << s.pipeline_error_resets << "/"
             << MAX_PIPELINE_RESETS << ")..." << std::endl;
-  // 先停读帧线程，避免其与 stop_pipeline 释放 appsrc 发生数据竞争（use-after-free）。
-  // 恢复顺序：shm 线程 → pipeline → pipeline → shm 线程。
-  stop_shm_frame_reader(u);
-  stop_pipeline(u);
+  // 停止顺序由 stop_pipeline_and_reader 统一保证（A-5）：
+  // 先清标志 → 再停管线解除 appsrc 阻塞 push → 最后 join 读线程。
+  stop_pipeline_and_reader(u);
   start_pipeline(u);
   start_shm_frame_reader(u);
 }
@@ -170,8 +189,13 @@ void start_pipeline(int u) {
 
   s.webrtcbin = gst_bin_get_by_name(GST_BIN(s.pipeline),
                                     ("webrtc" + std::to_string(u)).c_str());
-  s.appsrc = gst_bin_get_by_name(GST_BIN(s.pipeline),
-                                 ("godotsrc" + std::to_string(u)).c_str());
+  {
+    // A-5：与读帧线程的访问互斥。此处读线程尚未启动，加锁是为了与任何残留
+    // 的 stop/push 串行化，保持"指针读取一律在锁内"的简单不变式。
+    std::lock_guard<std::mutex> lock(s.appsrc_mutex);
+    s.appsrc = gst_bin_get_by_name(GST_BIN(s.pipeline),
+                                   ("godotsrc" + std::to_string(u)).c_str());
+  }
   s.frame_counter = 0;
 
   if (s.appsrc) {
@@ -223,9 +247,14 @@ void stop_pipeline(int u) {
     g_object_unref(s.webrtcbin);
     s.webrtcbin = nullptr;
   }
-  if (s.appsrc) {
-    g_object_unref(s.appsrc);
-    s.appsrc = nullptr;
+  {
+    // A-5：先摘引用（此后 push 不会再拿到它），再解引用。读帧线程若正持有自己的
+    // 引用，元素会存活到它释放为止，不会 UAF。
+    std::lock_guard<std::mutex> lock(s.appsrc_mutex);
+    if (s.appsrc) {
+      g_object_unref(s.appsrc);
+      s.appsrc = nullptr;
+    }
   }
 
   // 4. 最后销毁 pipeline（它的析构会级联释放所有剩余子元素）
@@ -233,4 +262,12 @@ void stop_pipeline(int u) {
     gst_object_unref(s.pipeline);
     s.pipeline = nullptr;
   }
+}
+
+void stop_pipeline_and_reader(int u) {
+  // A-5：顺序不可颠倒，理由见 pipeline.h 的声明处注释。
+  // 先清标志 → 再停管线（flush 解除 push 阻塞）→ 最后 join。
+  session(u).shm_running = false;
+  stop_pipeline(u);
+  stop_shm_frame_reader(u);
 }

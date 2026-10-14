@@ -209,7 +209,6 @@ bool load_config(Config &cfg, const std::string &config_path) {
     // 原实现默认 "vp8_sw"，于是"encoding 段存在但没写 type"会切到软件属性集、
     // 却仍用 NVENC 元素名 —— 这正是 L-07 的默认错配。
     const std::string type = get_string(e, "type", "nvenc");
-    cfg.enc_codec_name = get_string(e, "codec", cfg.enc_codec_name);
     cfg.enc_is_hardware = (type == "nvenc" || type == "vaapi" || type == "qsv");
 
     // L-07：encoder 未显式给出时由 type 推导，显式给出时校验类别一致。

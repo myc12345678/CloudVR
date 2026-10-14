@@ -282,34 +282,14 @@ static void handle_json_message(int u, const gchar *text) {
 
   JsonObject *obj = json_node_get_object(root);
 
-  // input 消息已在 on_peer_message 快速通道中处理，这里不再进入
-  // 保留分支以防从其他路径到达
-  if (json_object_has_member(obj, "input")) {
-    JsonObject *input = json_object_get_object_member(obj, "input");
-    // 回退路径：重新用 json-glib 序列化
-    {
-      JsonNode *input_root = json_node_new(JSON_NODE_OBJECT);
-      json_node_set_object(input_root, input);
-      JsonGenerator *gen = json_generator_new();
-      json_generator_set_root(gen, input_root);
-      gchar *text = json_generator_to_data(gen, nullptr);
-      const int gpu = session(u).gpu;
-      const int player = session(u).local_player;
-      send_to_godot(gpu, player, text, strlen(text));
-      g_free(text);
-      g_object_unref(gen);
-      json_node_free(input_root);
-    }
-    g_object_unref(parser);
-    return;
-  }
+  // 注：原此处有一段 "input" 回退分支（用 json-glib 重新序列化后转发）。
+  // on_peer_message 已用前缀快速通道拦下所有 {"input":…}，该分支不可达（D-5），已删除。
 
   if (json_object_has_member(obj, "reset")) {
     g_print("Received reset, triggering renegotiation\n");
-    // 与 pipeline.cpp::maybe_reset_pipeline 相同的顺序：先停读帧线程再重建管线，
-    // 防止 shm 读线程在 stop_pipeline 释放 appsrc 期间持旧指针访问（use-after-free）。
-    stop_shm_frame_reader(u);
-    stop_pipeline(u);
+    // 停止顺序由 stop_pipeline_and_reader 统一保证（A-5）：先清 shm_running、
+    // 再停管线解除 appsrc 的阻塞 push、最后 join 读线程。颠倒会导致主循环死锁。
+    stop_pipeline_and_reader(u);
     start_pipeline(u);
     start_shm_frame_reader(u);
     g_object_unref(parser);

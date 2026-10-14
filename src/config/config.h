@@ -56,7 +56,6 @@ struct Config {
   std::string http_tls_key_path;      // 私钥（PEM，敏感：建议 CLOUDVR_TLS_KEY 注入）
 
   // ---- Encoding ----
-  std::string enc_codec_name = "h264";
   bool enc_is_hardware = true;
   std::string enc_pipeline_elem = "nvautogpuh264enc";
   std::string enc_options =

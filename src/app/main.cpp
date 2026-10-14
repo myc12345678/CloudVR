@@ -1,4 +1,5 @@
 #include <csignal>
+#include <glib-unix.h>
 #include <gst/gst.h>
 #include <iostream>
 #include <libsoup/soup.h>
@@ -14,19 +15,24 @@
 #include "signalling/signalling_server.h"
 #include "transport/tcp_server.h"
 
-static void on_signal(int /*signum*/) {
-  // 置位关停标志，停止所有后台重连定时器，并让主循环退出以走干净清理
+// A-16：信号回调必须跑在**主循环**里，而不是信号处理器上下文。
+// g_main_loop_quit() 不是 async-signal-safe 的（它会去拿 GMainContext 的锁），
+// 若信号正好在主循环持锁时到达就可能死锁——表现为 Ctrl-C 没反应。
+// g_unix_signal_add() 内部用 self-pipe + GSource，回调在主循环线程执行，安全。
+static gboolean on_signal_quit(gpointer /*data*/) {
   shutting_down = true;
+  std::cout << "收到退出信号，正在优雅关停…" << std::endl;
   if (loop)
     g_main_loop_quit(loop);
+  return G_SOURCE_REMOVE;
 }
 
 int main(int argc, char *argv[]) {
   gst_init(&argc, &argv);
   loop = g_main_loop_new(nullptr, FALSE);
 
-  (void)std::signal(SIGINT, on_signal);
-  (void)std::signal(SIGTERM, on_signal);
+  g_unix_signal_add(SIGINT, on_signal_quit, nullptr);  // A-16
+  g_unix_signal_add(SIGTERM, on_signal_quit, nullptr);
 
   // ---- 运行期加载 config.json（不再编译期生成）----
   // 支持 --config <path> 显式指定；否则依次尝试当前目录 / 上级目录的 config.json。
@@ -146,8 +152,7 @@ int main(int argc, char *argv[]) {
     stop_godot_tcp_server(g);
   }
   for (int u = 0; u < g_config.max_users; ++u) {
-    stop_shm_frame_reader(u);
-    stop_pipeline(u);
+    stop_pipeline_and_reader(u);
   }
   g_main_loop_unref(loop);
   return 0;

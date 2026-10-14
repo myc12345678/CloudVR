@@ -5,9 +5,13 @@
 #include <csignal>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
+
+#include <glib.h>
 
 #include "util/common.h"
 
@@ -21,6 +25,7 @@ struct GodotChild {
   int gpu = -1;            // 该子进程负责的 GPU 索引
   unsigned restart_attempts = 0; // 已连续重启次数（指数退避计数）
   guint restart_source = 0;      // 重启定时器 source id（0 表示无待触发重启）
+  uint64_t started_ms = 0;       // D-8：本次启动时刻，用于"稳定运行即清零退避"
 };
 
 // 固定上限，与 gpu_count 校验保证不越界。
@@ -30,21 +35,97 @@ bool g_started = false;
 // 指数退避重启封顶（秒）。
 constexpr unsigned RESTART_MAX_DELAY_S = 30;
 
-// 注入 NVIDIA PRIME render offload 环境变量，强制 Godot 使用独显。
-// 与 scripts/run_godot.sh 保持一致：笔记本混合显卡下窗口失焦/最小化时若不加
-// 这些变量，系统会切到核显导致帧率骤降。
-void apply_prime_env() {
-  setenv("__NV_PRIME_RENDER_OFFLOAD", "1", 1);
-  setenv("__GLX_VENDOR_LIBRARY_NAME", "nvidia", 1);
-  setenv("DRI_PRIME", "1", 1);
-  // Vulkan ICD 若未指定则指向 NVIDIA ICD。
-  if (getenv("VK_ICD_FILENAMES") == nullptr) {
-    setenv("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/nvidia_icd.json", 1);
+// 在**父进程**里构造子进程环境：复制当前 environ，并按需覆盖 PRIME 相关变量。
+// 与 scripts/run_godot.sh 保持一致：笔记本混合显卡下窗口失焦/最小化时若不加这些
+// 变量，系统会切到核显导致帧率骤降。
+//
+// 为什么不在子进程里 setenv：fork() 之后、exec() 之前，子进程只能调用
+// async-signal-safe 的函数（A-11）。本进程是多线程的（shm 读线程 / TCP 线程 /
+// GLib 主循环，且 gst_init 已起线程），子进程里调用 setenv/getenv/malloc/iostream
+// 可能撞上其它线程在 fork 瞬间持有的锁而死锁。
+static void build_child_env(bool inject_prime,
+                            std::vector<std::string> &storage,
+                            std::vector<char *> &envp) {
+  storage.clear();
+  // 用 GLib 取当前环境，避免自行声明 extern char **environ（放进匿名命名空间
+  // 会变成内部链接符号，链接期报 relocation 错误）。
+  gchar **current_env = g_get_environ();
+  for (gchar **e = current_env; e != nullptr && *e != nullptr; ++e)
+    storage.emplace_back(*e);
+  g_strfreev(current_env);
+
+  const auto set_var = [&storage](const char *key, const char *value) {
+    const std::string prefix = std::string(key) + "=";
+    for (auto &kv : storage) {
+      if (kv.rfind(prefix, 0) == 0) {
+        kv = prefix + value;
+        return;
+      }
+    }
+    storage.emplace_back(prefix + value);
+  };
+  const auto has_var = [&storage](const char *key) {
+    const std::string prefix = std::string(key) + "=";
+    for (const auto &kv : storage)
+      if (kv.rfind(prefix, 0) == 0) return true;
+    return false;
+  };
+
+  if (inject_prime) {
+    set_var("__NV_PRIME_RENDER_OFFLOAD", "1");
+    set_var("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
+    set_var("DRI_PRIME", "1");
+    // Vulkan ICD 仅在未指定时指向 NVIDIA ICD
+    if (!has_var("VK_ICD_FILENAMES"))
+      set_var("VK_ICD_FILENAMES", "/usr/share/vulkan/icd.d/nvidia_icd.json");
   }
+
+  // 注意：必须等 storage 全部填充完再取 c_str()，否则 vector 扩容会让先前
+  // 取得的指针失效。
+  envp.clear();
+  envp.reserve(storage.size() + 1);
+  for (auto &kv : storage)
+    envp.push_back(const_cast<char *>(kv.c_str()));
+  envp.push_back(nullptr);
 }
 
 // fork + exec Godot 子进程。成功返回子进程 pid，失败返回 -1。
+//
+// A-11：所有准备工作都在 **fork 之前** 完成（路径解析、argv/envp 拼接），
+// 子进程里只调用 execve/_exit —— 这两个是 POSIX 明确列为 async-signal-safe 的。
 pid_t spawn_godot(int gpu) {
+  const std::string project = g_config.godot_project_path;
+  const std::string binary = g_config.godot_binary;
+  const std::string gpu_arg = "--dsh-gpu=" + std::to_string(gpu);
+  const std::string players_arg =
+      "--dsh-players=" + std::to_string(g_config.players_per_gpu);
+
+  // 参数：godot --path <project> -- --dsh-gpu=<g> --dsh-players=<n>
+  // 注意：--gpu-index 是 Vulkan 物理设备选择，这里暂不传（单 GPU 阶段），
+  // 多 GPU 阶段由 P4 在 spawn 时按 gpu 传入 --gpu-index <g>。
+  const char *argv[] = {binary.c_str(),
+                        "--path",
+                        project.c_str(),
+                        "--",
+                        gpu_arg.c_str(),
+                        players_arg.c_str(),
+                        nullptr};
+
+  // 在父进程里把 binary 解析为绝对路径：execve 不做 PATH 查找，而且
+  // g_find_program_in_path 会分配内存，绝不能在子进程里调用。
+  gchar *resolved = g_find_program_in_path(binary.c_str());
+  const std::string exe_path = resolved != nullptr ? resolved : binary;
+  g_free(resolved);
+  if (resolved == nullptr) {
+    std::cerr << "godot_process: 未找到可执行文件 " << binary
+              << "（execve 不做 PATH 查找）" << std::endl;
+    return -1;
+  }
+
+  std::vector<std::string> env_storage;
+  std::vector<char *> envp;
+  build_child_env(g_config.godot_set_prime_env, env_storage, envp);
+
   const pid_t pid = fork();
   if (pid < 0) {
     std::cerr << "godot_process: fork failed: " << std::strerror(errno)
@@ -53,29 +134,12 @@ pid_t spawn_godot(int gpu) {
   }
 
   if (pid == 0) {
-    // ---- 子进程 ----
-    if (g_config.godot_set_prime_env) {
-      apply_prime_env();
-    }
-
-    const std::string project = g_config.godot_project_path;
-    const std::string binary = g_config.godot_binary;
-    const std::string gpu_arg = "--dsh-gpu=" + std::to_string(gpu);
-    const std::string players_arg =
-        "--dsh-players=" + std::to_string(g_config.players_per_gpu);
-
-    // 参数：godot --path <project> -- --dsh-gpu=<g> --dsh-players=<n>
-    // 注意：--gpu-index 是 Vulkan 物理设备选择，这里暂不传（单 GPU 阶段），
-    // 多 GPU 阶段由 P4 在 spawn 时按 gpu 传入 --gpu-index <g>。
-    execlp(binary.c_str(), binary.c_str(), "--path", project.c_str(), "--",
-           gpu_arg.c_str(), players_arg.c_str(), static_cast<char *>(nullptr));
-
-    // execlp 失败才走到这里
-    std::cerr << "godot_process: exec failed for binary=" << binary
-              << " (" << std::strerror(errno) << ")" << std::endl;
-    _exit(127);
+    // ---- 子进程：只允许 async-signal-safe 的调用 ----
+    execve(exe_path.c_str(), const_cast<char *const *>(argv), envp.data());
+    _exit(127); // execve 失败：不打印（iostream/strerror 都不安全）
   }
 
+  g_children[gpu].started_ms = now_ms();
   return pid;
 }
 
@@ -130,6 +194,18 @@ void on_child_exit(GPid pid, gint status, gpointer data) {
   std::cout << "godot_process: Godot (gpu=" << gpu << ", pid=" << pid
             << ") exited, status=" << status
             << (exited_cleanly ? " (clean)" : " (unexpected)") << std::endl;
+
+  // D-8：子进程若已稳定运行足够久，说明那是一次偶发退出而非崩溃循环，退避计数
+  // 应归零。原实现只在首次启动时清零，导致累计 5 次退出后重启延迟永久固定在 30s。
+  constexpr uint64_t kStableRunMs = 60000;
+  const uint64_t alive_ms =
+      c.started_ms != 0 ? now_ms() - c.started_ms : 0;
+  if (alive_ms > kStableRunMs && c.restart_attempts > 0) {
+    std::cout << "godot_process: Godot 稳定运行 " << alive_ms / 1000
+              << "s，重启退避计数归零（原 " << c.restart_attempts << " 次）"
+              << std::endl;
+    c.restart_attempts = 0;
+  }
 
   c.pid = -1;
   if (!shutting_down.load()) {

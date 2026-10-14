@@ -33,6 +33,9 @@ struct UserSession {
   GstElement *pipeline = nullptr;
   GstElement *webrtcbin = nullptr;
   GstElement *appsrc = nullptr;
+  // A-5：appsrc 会被读帧线程（push）与主循环（stop/start pipeline）并发访问。
+  // 读侧持引用使用，写侧摘引用时加锁，避免 use-after-free。
+  std::mutex appsrc_mutex;
   guint bus_watch_id = 0;
   std::atomic<uint64_t> frame_counter{0};
   // pipeline 错误自复位状态（原先 pipeline.cpp 内的 static，现按用户隔离）

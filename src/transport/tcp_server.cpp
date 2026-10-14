@@ -19,35 +19,7 @@
 
 // ======================== 内部工具 ========================
 
-static bool read_exact(int fd, void *buffer, size_t size) {
-  auto *dst = static_cast<uint8_t *>(buffer);
-  size_t total = 0;
-  while (total < size) {
-    ssize_t n = recv(fd, dst + total, size - total, 0);
-    if (n > 0) {
-      total += static_cast<size_t>(n);
-      continue;
-    }
-    if (n == 0) {
-      // 对端正常关闭连接
-      std::cerr << "TCP peer closed connection" << std::endl;
-      return false;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // 超时（如果设置了 SO_RCVTIMEO）——不是错误，继续等待
-      // 但如果使用了 Keepalive 策略，这里不应触发
-      continue;
-    }
-    if (errno == EINTR) {
-      // 被信号中断——重试
-      continue;
-    }
-    // 其他真正错误
-    std::cerr << "TCP recv error: " << std::strerror(errno) << std::endl;
-    return false;
-  }
-  return true;
-}
+// 注：原 read_exact() 只服务于已删除的 TCP 视频回传分支（见 D-4），故一并移除。
 
 // ======================== 发送数据给 Godot ========================
 
@@ -150,9 +122,9 @@ static void tcp_server_loop(int gpu) {
   while (t.tcp_running.load()) {
     sockaddr_in client_addr{};
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(
+    const int client_fd = accept4(
         t.tcp_server_fd, reinterpret_cast<sockaddr *>(&client_addr),
-        &client_len);
+        &client_len, SOCK_CLOEXEC); // A-12：不泄漏给 Godot 子进程
     if (client_fd < 0) {
       if (t.tcp_running.load()) {
         std::cerr << "accept() failed: " << std::strerror(errno) << std::endl;
@@ -189,26 +161,28 @@ static void tcp_server_loop(int gpu) {
     }
     std::cout << "Godot TCP client connected" << std::endl;
 
+    // D-4：原先这里是一条"读 4 字节长度 + 负载 → push_jpeg_frame_to_appsrc"的
+    // TCP 视频回传分支。Godot 早已改为只走共享内存发帧（main.gd 的
+    // _send_frame_via_shm），该分支是死代码，却带来三个实际问题：
+    //   1. 把控制端口变成**对外可写的输入面**（任何主机都能往里灌数据）；
+    //   2. 数据被张冠李戴投给"该 GPU 的第一个用户"（多玩家时错人）；
+    //   3. 与 appsrc 释放路径竞争，可能触发 use-after-free。
+    // 控制指令是单向的（sender → Godot），因此这里改为只做**保持与检测**：
+    // 阻塞在 recv() 上等待对端关闭（stop_godot_tcp_server 用 shutdown 唤醒）。
+    char probe = 0;
     while (t.tcp_running.load()) {
-      uint32_t net_len = 0;
-      if (!read_exact(client_fd, &net_len, sizeof(net_len)))
-        break;
-
-      uint32_t frame_len = ntohl(net_len);
-      if (frame_len == 0 || frame_len > 8 * 1024 * 1024) {
-        std::cerr << "Invalid frame length: " << frame_len << std::endl;
+      const ssize_t n = recv(client_fd, &probe, 1, 0);
+      if (n > 0) {
+        // 对端仍按已废弃协议发数据：记一次并断开，绝不把未知格式当有效负载处理
+        std::cerr << "Godot TCP 控制通道收到意外数据（该通道已改为单向），断开"
+                  << std::endl;
         break;
       }
-
-      std::string jpeg(frame_len, '\0');
-      if (!read_exact(client_fd, jpeg.data(), frame_len))
-        break;
-
-      // 该 GPU 的 TCP 上目前不区分玩家（视频帧回传是旧 TCP 路径，已废弃）。
-      // push_jpeg_frame_to_appsrc 需要 u，这里用该 GPU 的首个用户 u=gpu*players_per_gpu。
-      int u = gpu * g_config.players_per_gpu;
-      push_jpeg_frame_to_appsrc(u, reinterpret_cast<const uint8_t *>(jpeg.data()),
-                                jpeg.size());
+      if (n == 0)
+        break; // 对端正常关闭
+      if (errno == EINTR)
+        continue;
+      break; // 其它错误（含 shutdown 唤醒）
     }
 
     std::cout << "Godot TCP client disconnected" << std::endl;
@@ -260,7 +234,8 @@ static void shm_reader_loop(int u) {
       // Godot 使用 FileAccess 写入普通文件到 /dev/shm，
       // 因此这里用 open() 而非 shm_open() 打开同一文件。
       // /dev/shm 是 tmpfs，文件内容即驻留在 RAM 中，mmap 实现零拷贝。
-      s.shm_fd = open(s.shm_path.c_str(), O_RDONLY);
+      // A-12：O_CLOEXEC —— 共享内存 fd 同样不应被 Godot 子进程继承
+      s.shm_fd = open(s.shm_path.c_str(), O_RDONLY | O_CLOEXEC);
       if (s.shm_fd < 0) {
         std::cerr << "open(" << s.shm_path
                   << ") failed: " << std::strerror(errno)
@@ -284,6 +259,32 @@ static void shm_reader_loop(int u) {
         s.shm_fd = -1;
         usleep(1000000);
         continue;
+      }
+
+      // S-7：帧文件由 Godot 以默认权限创建（受 umask 影响，可能是 0644 甚至 0666）。
+      // 同机其它用户若能写它，就等于能往视频流里注入任意画面；能读它则等于能旁路
+      // 观看画面。这里在打开后收紧权限：
+      //   - 属主不是自己 → 拒绝使用（文件可能被他人替换）
+      //   - 组/其他可写 → fchmod 收紧到 0600（Godot 已持有 fd，权限变更不影响它）
+      struct stat ost{};
+      if (fstat(s.shm_fd, &ost) == 0) {
+        if (ost.st_uid != getuid()) {
+          std::cerr << "SHM 文件属主(uid=" << ost.st_uid
+                    << ") 非当前用户，拒绝使用: " << s.shm_path << std::endl;
+          close(s.shm_fd);
+          s.shm_fd = -1;
+          usleep(1000000);
+          continue;
+        }
+        // 只要组/其他有任何权限就收紧：0644 虽不可被写（无法注入画面），
+        // 但**可被读**——同机其它用户能旁路取走画面内容，同样不该允许。
+        if ((ost.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+          if (fchmod(s.shm_fd, S_IRUSR | S_IWUSR) == 0) {
+            std::cerr << "SHM 文件权限过宽(" << std::oct
+                      << (ost.st_mode & 0777) << std::dec
+                      << ")，已收紧到 600: " << s.shm_path << std::endl;
+          }
+        }
       }
 
       s.shm_frame = static_cast<SharedFrameHeader *>(
@@ -419,7 +420,10 @@ void start_godot_tcp_server(int gpu) {
   if (t.tcp_thread.joinable())
     t.tcp_thread.join();
 
-  t.tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  // A-12：SOCK_CLOEXEC —— 否则 sender 每次 fork/exec 启动 Godot 时，子进程都会
+  // 继承这个监听 fd；父进程崩溃/退出后端口仍被 Godot 占着，重启 sender 会
+  // "Address already in use"，且对端收不到 FIN。
+  t.tcp_server_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (t.tcp_server_fd < 0) {
     std::cerr << "socket() failed: " << std::strerror(errno) << std::endl;
     return;
@@ -430,7 +434,9 @@ void start_godot_tcp_server(int gpu) {
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  // C-6/S-3：控制通道只服务本机的 Godot 子进程（sender 自己 fork/exec 出来的），
+  // 原先绑 INADDR_ANY 会让局域网任意主机都能连上来注入数据。这里收紧到回环。
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(t.tcp_port);
 
   if (bind(t.tcp_server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
