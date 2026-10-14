@@ -43,12 +43,20 @@ int main(int argc, char *argv[]) {
   candidates.push_back("config.json");    // 从仓库根目录运行
   candidates.push_back("../config.json"); // 从 build/ 目录运行
 
-  if (load_config_from_candidates(g_config, candidates)) {
+  switch (load_config_from_candidates(g_config, candidates)) {
+  case ConfigLoad::Loaded:
     std::cout << "config.json loaded (runtime) -> " << g_config.frame_width
               << "x" << g_config.frame_height << "@" << g_config.frame_fps
               << "fps" << std::endl;
-  } else {
-    std::cout << "No valid config.json, using built-in defaults" << std::endl;
+    break;
+  case ConfigLoad::Invalid:
+    // 配置存在但非法：fail-closed，绝不带着默认值继续跑。
+    std::cerr << "FATAL: 配置非法，拒绝启动" << std::endl;
+    g_main_loop_unref(loop);
+    return 1;
+  case ConfigLoad::NotFound:
+    std::cout << "No config.json found, using built-in defaults" << std::endl;
+    break;
   }
 
   // ---- 环境变量覆盖（优先级高于 config.json）----

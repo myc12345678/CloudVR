@@ -67,6 +67,31 @@ std::string expand_index_template(const std::string &tmpl, int index) {
   return out;
 }
 
+// ======================== 编码器 / type 一致性（L-07）========================
+// encoding.type 选的是**属性集**（NVENC 专有 vs vp8enc 专有），encoding.encoder
+// 选的是**元素名**。二者独立取值就会生成非法组合，例如 type=vp8_sw 时把
+// `deadline=1` 传给 nvautogpuh264enc —— 实测报
+//   Pipeline create failed: no property "deadline" in element "nvautogpuh264enc"
+// 管线直接创建失败。更隐蔽的是"encoding 段存在但没写 type"时的默认错配。
+// 因此：未显式给 encoder → 由 type 推导；显式给出 → 校验类别一致。
+static const char *default_encoder_for(const std::string &type) {
+  if (type == "nvenc") return "nvautogpuh264enc";
+  if (type == "vaapi") return "vah264enc";
+  if (type == "qsv") return "qsvh264enc";
+  return "vp8enc"; // vp8_sw 及未知 type → 软件 VP8
+}
+
+// 元素类别是否与 type 相符（按 GStreamer 元素的插件前缀区分）。
+static bool encoder_matches_type(const std::string &type,
+                                 const std::string &elem) {
+  const auto has_prefix = [&elem](const char *p) { return elem.rfind(p, 0) == 0; };
+  if (type == "nvenc") return has_prefix("nv");
+  if (type == "vaapi") return has_prefix("va");
+  if (type == "qsv") return has_prefix("qsv");
+  // 软件路径（vp8_sw 及未知 type）：不接受硬件编码器
+  return !has_prefix("nv") && !has_prefix("va") && !has_prefix("qsv");
+}
+
 // ======================== 启动期配置强校验 ========================
 // 放在"配置进入系统之前"，把非法值一次挡掉。历史上这些字段只做类型转换：
 //   video.fps = 0             → gst_util_uint64_scale 除零 → SIGFPE（C-1）
@@ -180,10 +205,26 @@ bool load_config(Config &cfg, const std::string &config_path) {
 
   // ---- encoding ----
   if (JsonObject *e = get_object(obj, "encoding")) {
-    std::string type = get_string(e, "type", "vp8_sw");
+    // 默认 type 与 config.h 的其它 encoding 默认值保持一致（硬件 + NVENC 属性集）。
+    // 原实现默认 "vp8_sw"，于是"encoding 段存在但没写 type"会切到软件属性集、
+    // 却仍用 NVENC 元素名 —— 这正是 L-07 的默认错配。
+    const std::string type = get_string(e, "type", "nvenc");
     cfg.enc_codec_name = get_string(e, "codec", cfg.enc_codec_name);
-    cfg.enc_pipeline_elem = get_string(e, "encoder", cfg.enc_pipeline_elem);
     cfg.enc_is_hardware = (type == "nvenc" || type == "vaapi" || type == "qsv");
+
+    // L-07：encoder 未显式给出时由 type 推导，显式给出时校验类别一致。
+    if (json_object_has_member(e, "encoder"))
+      cfg.enc_pipeline_elem = get_string(e, "encoder", cfg.enc_pipeline_elem);
+    else
+      cfg.enc_pipeline_elem = default_encoder_for(type);
+
+    if (!encoder_matches_type(type, cfg.enc_pipeline_elem)) {
+      std::cerr << "FATAL: encoding.encoder=" << cfg.enc_pipeline_elem
+                << " 与 encoding.type=" << type
+                << " 不匹配（type 决定属性集，二者类别必须一致），拒绝启动"
+                << std::endl;
+      return false;
+    }
 
     if (cfg.enc_is_hardware) {
       int bitrate = get_int(e, "bitrate_kbps", 3000);
@@ -247,17 +288,23 @@ bool load_config(Config &cfg, const std::string &config_path) {
   return true;
 }
 
-bool load_config_from_candidates(Config &cfg,
-                                 const std::vector<std::string> &paths) {
+ConfigLoad load_config_from_candidates(Config &cfg,
+                                       const std::vector<std::string> &paths) {
   for (const auto &p : paths) {
-    if (g_file_test(p.c_str(), G_FILE_TEST_EXISTS)) {
-      // 找到一个存在的 config.json：加载成功则采纳，失败则直接用默认值返回。
-      return load_config(cfg, p);
-    }
+    if (!g_file_test(p.c_str(), G_FILE_TEST_EXISTS))
+      continue;
+    // 找到第一个存在的 config.json 就**只用它**：加载失败即视为非法配置，
+    // 不再继续尝试后续候选（否则 --config 写错会悄悄落到别的文件上）。
+    if (load_config(cfg, p))
+      return ConfigLoad::Loaded;
+    std::cerr << "FATAL: " << p
+              << " 存在但解析/校验失败；拒绝启动（不回退到内置默认值，"
+                 "以免用错参数静默运行）" << std::endl;
+    return ConfigLoad::Invalid;
   }
   std::cerr << "config.json not found (searched " << paths.size()
             << " candidate path(s)) -- using built-in defaults" << std::endl;
-  return false;
+  return ConfigLoad::NotFound;
 }
 
 // ======================== 环境变量覆盖 ========================

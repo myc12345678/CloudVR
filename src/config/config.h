@@ -81,7 +81,18 @@ extern Config g_config;
 bool load_config(Config &cfg, const std::string &config_path);
 
 // 依次尝试候选路径，加载第一个存在的 config.json。
-bool load_config_from_candidates(Config &cfg,
+// 配置加载结果。区分"没找到"与"找到但非法"很重要：
+//   没找到 → 用内置默认值是合理的（例如从 build/ 目录直接运行）；
+//   找到但非法 → 必须**拒绝启动**，绝不能静默回退默认值——否则用户会以为
+//   自己的配置生效了，实际跑的是另一套参数（正是历史上"页面能开但没画面"
+//   这类问题的温床）。
+enum class ConfigLoad {
+  Loaded,   // 找到并成功加载（且通过了强校验）
+  NotFound, // 候选路径均不存在 → 调用方可用内置默认值
+  Invalid,  // 找到了但解析/校验失败 → 调用方应终止
+};
+
+ConfigLoad load_config_from_candidates(Config &cfg,
                                  const std::vector<std::string> &paths);
 
 // 用环境变量覆盖配置中的敏感/机器相关字段（环境变量优先级最高）。

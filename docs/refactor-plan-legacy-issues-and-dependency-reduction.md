@@ -120,10 +120,12 @@
 | **L-04** | `--gpu-index` 未传给 Godot 子进程 | `src/capture/godot_process.cpp:67-69`（注释明说暂不传） | 源码 | 多/混合显卡无法定向选卡 | P4 起按 gpu 传 `--gpu-index <g>`；**注意本机实测设备序为 Intel=0、NVIDIA=1，与直觉相反** |
 | **L-05** | 编码参数由字符串拼接，未校验元素属性存在性 | `src/config/config.cpp:160-172`；`pipeline.cpp:138-141` | 源码 | 配置写了不支持的属性 → `gst_parse_launch` 失败且错误信息不指向配置项 | 启动时对关键属性做 `gst-inspect` 校验或捕获解析错误并回报字段名 |
 | **L-06** | 单卡 NVENC 并发上限（GeForce 约 3 路）未做容量校验 | `docs/multi-user-multi-gpu-design.md:330`；`config.json` `players_per_gpu=3` 已踩线 | 文档 | 超限时第 4 路编码失败，用户黑屏 | 启动时按卡型校验 `players_per_gpu` 上限并拒绝启动或降级软件编码 |
-| **L-07** | **`encoding.type` 与 `encoding.encoder` 必须手动保持一致，否则报错完全不指向配置** | `src/config/config.cpp:155-180`：按 `type` 选 **options/payloader**，却按 `encoder` 选**元素名** | ✅ **实测**：`type=vp8_sw` 但 `encoder=nvautogpuh264enc` → `Pipeline create failed: no property "deadline" in element "nvautogpuh264enc"` × **6**（全部管线失败）；改成 `encoder=vp8enc` 后 → **失败 0 次、推送帧 57 条** | 用户按 README「切 `vp8_sw`」操作后仍然全黑，且报错指向一个用户没写过的属性名，排障成本极高 | 由 `type` 唯一决定元素名（或校验二者一致并在启动时报出配置项名）；README 明确"两个字段都要改" |
+| **L-07** | ~~**`encoding.type` 与 `encoding.encoder` 必须手动保持一致，否则报错完全不指向配置**~~ **✅ 已解决** | `src/config/config.cpp:155-180`：按 `type` 选 **options/payloader**，却按 `encoder` 选**元素名** | ✅ **实测**：`type=vp8_sw` 但 `encoder=nvautogpuh264enc` → `Pipeline create failed: no property "deadline" in element "nvautogpuh264enc"` × **6**（全部管线失败）；改成 `encoder=vp8enc` 后 → **失败 0 次、推送帧 57 条** | 用户按 README「切 `vp8_sw`」操作后仍然全黑，且报错指向一个用户没写过的属性名，排障成本极高 | ✅ **已修复**：`encoder` 未显式给出时由 `type` 推导（nvenc→nvautogpuh264enc、vaapi→vah264enc、qsv→qsvh264enc、其余→vp8enc）；显式给出时校验类别一致，不一致启动即报出**配置项名**并拒绝启动。另修掉默认错配：原默认 `type="vp8_sw"` 与 config.h 的硬件默认值冲突（encoding 段存在但没写 type 时就会生成非法组合），现改为默认 `nvenc`。实测：只写 `type=vp8_sw` → 正常出流（28 帧、0 管线失败）；`vp8_sw`+NVENC 元素 / `nvenc`+vp8enc → 均被拒并指明字段 |
 
 > **L-01 已于 2026-10-14 修复并实测验证**（默认 `nvenc` 配置下 `Pipeline create failed: 0`、推送 62 帧、信令产出带真实 SPS/PPS 的 H.264 offer）。它曾是唯一"默认配置当前就坏"的功能缺陷。
-> **L-07 仍未修复**，是"想回退到软件编码也回退不了"的隐藏坑：`type` 改了但 `encoder` 没改时，报错完全不指向配置项。
+> **L-07 已于 2026-10-14 修复**：`type` 现在是唯一权威，`encoder` 缺省时自动推导、显式给出时校验一致性，不再需要"两个字段都改"。
+>
+> 附带修正一处**更严重的语义问题**：`load_config` 失败时 main 原先只是打印 "using built-in defaults" 并**继续运行**——即非法配置并不真的"拒绝启动"，而是静默回退默认值（用户会以为自己的配置生效了）。现将加载结果改为三态 `ConfigLoad{Loaded,NotFound,Invalid}`：找到但非法 → `FATAL` 并 exit 1；只有"候选路径都不存在"才回退默认值。
 
 ### 1.2 架构与耦合（P1）
 
